@@ -1,0 +1,19 @@
+# dependencies
+node_modules/
+
+# secrets — never commit
+.env
+.env.*
+!.env.example
+server/.bridge-token
+extension/config.local.js
+
+# temporary test / scratch output
+server/.test-tmp/
+server/.jobs/
+tmp/
+*.tmp
+*.log
+
+# OS / editor noise
+.DS_Store

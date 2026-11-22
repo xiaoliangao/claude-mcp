@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "ChatGPT MCP Bridge (local)",
+  "version": "0.3.0",
+  "description": "Lets a local Claude Code MCP server drive one dedicated chatgpt.com / gemini.google.com tab over ws://127.0.0.1. No other sites, no cookies.",
+  "minimum_chrome_version": "116",
+  "background": {
+    "service_worker": "background.js"
+  },
+  "permissions": ["tabs", "scripting", "alarms", "downloads"],
+  "host_permissions": ["https://chatgpt.com/*", "https://gemini.google.com/*"]
+}

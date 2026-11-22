@@ -1,0 +1,19 @@
+{
+  "name": "chatgpt-web-mcp-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local stdio MCP server bridging Claude Code to a ChatGPT tab in your everyday Chrome via a MV3 extension",
+  "type": "module",
+  "main": "server.mjs",
+  "engines": {
+    "node": ">=18.17"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node test-mcp.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "ws": "^8.23.0"
+  }
+}
