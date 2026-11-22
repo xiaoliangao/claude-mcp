@@ -5,7 +5,9 @@
 // It only reads the server's status file (.jobs/<job_id>.json, metadata only); the reply itself is
 // fetched afterwards with get_job or read from save_to.
 //
-// Exit codes: 0 done · 1 job failed · 2 unknown job or server gone · 3 timed out · 64 bad usage
+// Exit codes: 0 done · 1 job failed · 2 unknown job or server gone · 3 timed out · 4 the MCP tab was moved to another
+// conversation (status "tab_moved": the reply is not lost — open_conversation on the printed conversation_id, then
+// get_latest_reply; never send again) · 64 bad usage
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -38,6 +40,7 @@ function exit(code, data) {
 for (;;) {
   const job = await fs.readFile(file, 'utf8').then(JSON.parse, () => null);
   if (job?.status === 'done') exit(0, job);
+  if (job?.status === 'error' && job.error?.tab_moved) exit(4, { ...job, status: 'tab_moved' });
   if (job?.status === 'error') exit(1, job);
   if (!job && Date.now() > graceUntil) {
     exit(2, { job_id: id, status: 'unknown', error: { code: 'JOB_NOT_FOUND', message: 'no status file — unknown job_id, or it expired' } });

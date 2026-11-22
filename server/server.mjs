@@ -72,6 +72,11 @@ function defaultModeFor(site, fallback) {
 const DEFAULT_MODE = { chatgpt: defaultModeFor('chatgpt', null), gemini: defaultModeFor('gemini', 'Task') };
 // How long the mode toggle gets to render, and a pressed mode to show as selected (env: tests only).
 const MODE_WAIT_MS = Number(process.env.CHATGPT_BRIDGE_MODE_WAIT_MS) || 3_000;
+// Deep Research runs for minutes to an hour, and its progress / report UI was never observed (UNVERIFIED). A reply to
+// a research send that shows no report text (no Markdown) yet is waited out until its status rows have not changed
+// for this long, then read as it is with a warning (env: tests only).
+const RESEARCH_QUIET_MS = Number(process.env.CHATGPT_BRIDGE_RESEARCH_QUIET_MS) || 15 * 60_000;
+const isResearchTool = (t) => /research|研究/i.test(String(t ?? ''));
 
 // Must match SITES in extension/background.js and host_permissions in extension/manifest.json.
 const SITES = {
@@ -304,9 +309,11 @@ const jobs = new Map();
 // conversationId is where it went (filled in once a new chat gets its id), hashSeen latches once the page showed
 // it as the latest user message by its fingerprint. Since the last open_conversation: modeOverride = the mode the
 // caller chose explicitly (the default mode is then left alone), attached = upload_files attached files not yet
-// sent, stale = { expected, seen, at } once the tab was seen on another conversation (see notePage).
+// sent, stale = { expected, seen, at } once the tab was seen on another conversation (see notePage). Kept across
+// open_conversation: toolChoice = the composer tool turned on through this server (see reconcileTool), lastResearch =
+// the pendingSend of the last message sent with a research tool (see recentResearch).
 const siteState = Object.fromEntries(
-  SITE_NAMES.map((site) => [site, { activeJob: null, pendingSend: null, modeOverride: null, attached: false, stale: null }]),
+  SITE_NAMES.map((site) => [site, { activeJob: null, pendingSend: null, modeOverride: null, attached: false, stale: null, toolChoice: null, lastResearch: null }]),
 );
 
 // A navigation by open_conversation: the page is reloaded and every per-chat record starts over.
@@ -378,6 +385,28 @@ function assertFresh(site, s, nothing) {
     st.stale ? { expected_conversation_id: st.stale.expected, seen_conversation_id: st.stale.seen } : null,
   );
 }
+
+// 2026-11-22: the user switched the MCP tab to another conversation by hand while a reply was generating; wait-job
+// exited 1 (CONVERSATION_CHANGED / PAGE_STALE) although the reply completed fine, and reopening the conversation plus
+// get_latest_reply recovered it. A reply job that ends this way carries these details (tab_moved, the conversation to
+// reopen, what to do); wait-job.mjs exits 4 for it.
+function tabMovedDetails(site, conversationId, seen) {
+  const id = conversationId && !provisionalId(conversationId) ? conversationId : null;
+  const reopen = id ? `open_conversation { url_or_id: "${id}", site: "${site}" }` : 'open_conversation with the conversation the message went to (see the sidebar)';
+  return {
+    tab_moved: true,
+    conversation_id: id,
+    seen_conversation_id: seen ?? null,
+    recovery: `The reply is not lost — it keeps going in its own conversation. Call ${reopen} (it reloads the tab), then get_latest_reply (save_to recommended). Do NOT send the message again.`,
+  };
+}
+// Whether the last research send of `site` went to `conversationId`. Kept across open_conversation, so the reply job
+// after reopening that conversation (the tab-moved recovery) still knows it waits for Deep Research.
+function recentResearch(site, conversationId) {
+  const p = siteState[site].lastResearch;
+  return !!p && !!conversationId && !provisionalId(p.conversationId) && p.conversationId === conversationId && Date.now() - p.sentAt < JOB_MAX_MS;
+}
+
 // Tools called without "site" act on the site of the most recent open_conversation.
 let defaultSite = 'chatgpt';
 
@@ -394,6 +423,7 @@ function sendObserved(pending, s) {
   const b = pending.baseline;
   pending.observed =
     !!s.generating ||
+    !!s.research?.active || // fill_composer refuses while research runs, so this one is new too
     s.user_count > b.user_count ||
     (!!s.last_user_id && s.last_user_id !== b.last_user_id) ||
     (!!b.sent_hash && b.last_user_hash !== b.sent_hash && s.last_user_hash === b.sent_hash);
@@ -416,8 +446,16 @@ function finishJob(job, error) {
 function persistJob(job) {
   const base = { job_id: job.id, site: job.site, status: job.status, updated_at: Date.now() };
   let data;
-  if (job.status === 'running') data = { ...base, chars: job.chars };
-  else if (job.status === 'error') data = { ...base, error: { code: job.error.code, message: job.error.message } };
+  if (job.status === 'running') data = { ...base, chars: job.chars, ...(job.researching && { researching: true }) };
+  else if (job.status === 'error') {
+    // A moved tab (see tabMovedDetails): wait-job.mjs exits 4 and prints the conversation to reopen.
+    const moved = job.error.details?.tab_moved ? job.error.details : null;
+    data = {
+      ...base,
+      error: { code: job.error.code, message: job.error.message, ...(moved && { tab_moved: true, recovery: moved.recovery }) },
+      ...(moved && { conversation_id: moved.conversation_id }),
+    };
+  }
   else data = { ...base, conversation_id: job.reply.conversation_id, chars: job.reply.chars, sha256: job.reply.sha256, saved_to: job.savedTo, ...(job.warning && { warning: job.warning }) };
   job.persistedAt = Date.now();
   job.persisting = (job.persisting ?? Promise.resolve())
@@ -494,17 +532,34 @@ async function pollJob(job) {
   const provisional = !job.conversationId || job.conversationId.startsWith('local-');
   if (!provisional && s.conversation_id && s.conversation_id !== job.conversationId) {
     markStale(job.site, job.conversationId, s.conversation_id);
+    const moved = tabMovedDetails(job.site, job.conversationId, s.conversation_id);
     throw new ToolError(
       'CONVERSATION_CHANGED',
-      `MCP tab moved from conversation ${job.conversationId} to ${s.conversation_id}; reads on this tab are refused (PAGE_STALE) until open_conversation reloads it`,
+      `MCP tab moved from conversation ${job.conversationId} to ${s.conversation_id} (switched by hand?); reads on this tab are refused (PAGE_STALE) until open_conversation reloads it. ${moved.recovery}`,
+      moved,
     );
   }
   if (provisional && s.conversation_id) job.conversationId = s.conversation_id;
-  assertFresh(job.site, s, 'Nothing was read or saved');
+  try {
+    assertFresh(job.site, s, 'Nothing was read or saved');
+  } catch (e) {
+    if (e.code !== 'PAGE_STALE') throw e;
+    // Inside a reply job a stale page means the tab was moved too: same recovery.
+    const st = siteState[job.site];
+    const conv = provisionalId(job.conversationId) ? (st.stale?.expected ?? st.pendingSend?.conversationId ?? null) : job.conversationId;
+    const moved = tabMovedDetails(job.site, conv, st.stale?.seen ?? s.conversation_id);
+    throw new ToolError('PAGE_STALE', `${e.message}. ${moved.recovery}`, { ...e.details, ...moved });
+  }
 
   const pending = job.pending;
   const observed = !!pending && sendObserved(pending, s); // ahead of the generating check: a stop button latches it
-  if (s.generating) {
+  // Deep Research (UNVERIFIED UI): a research-specific sign counts like a stop button; a mere progress indicator only
+  // when the message went out with a research tool.
+  const research = s.research ?? null;
+  const researchSend = isResearchTool(pending?.tool) || recentResearch(job.site, s.conversation_id);
+  const researching = !!research?.active || (researchSend && !!research?.progress && !research?.completed);
+  job.researching = researching || (researchSend && !!s.generating);
+  if (s.generating || researching) {
     job.stable = null;
     job.lastActiveAt = Date.now();
     return;
@@ -538,13 +593,29 @@ async function pollJob(job) {
   if (!newReply) {
     job.stable = null;
     if (!fresh && s.last_role === null) throw new ToolError('NO_REPLY', 'the conversation has no messages yet');
-    if (Date.now() - job.lastActiveAt > SEND_NOT_OBSERVED_MS) {
+    // A research send may take a while to show its first sign of life.
+    if (Date.now() - job.lastActiveAt > (researchSend ? Math.max(SEND_NOT_OBSERVED_MS, RESEARCH_QUIET_MS) : SEND_NOT_OBSERVED_MS)) {
       throw new ToolError('NO_REPLY', 'the latest message is from the user and no reply is being generated');
     }
     return;
   }
 
   const now = Date.now();
+  // Deep Research: a reply without report text (its progress card, UNVERIFIED) is not the answer yet. Waited out until
+  // its status rows stop changing for RESEARCH_QUIET_MS, then read as it is, with a warning. A clarifying question or
+  // a report rendered as Markdown has text and completes like any reply.
+  const researchReply = researchSend || !!(research && (research.progress || research.frame || research.completed));
+  if (researchReply && !s.chars && !research?.completed) {
+    const key = research?.hash ?? s.hash;
+    if (job.quiet?.key !== key) job.quiet = { key, since: now };
+    if (now - job.quiet.since < RESEARCH_QUIET_MS) {
+      job.stable = null;
+      job.researching = true;
+      return;
+    }
+    job.warning = [job.warning, `the research reply has shown no report text and no progress for ${Math.round(RESEARCH_QUIET_MS / 60_000)} min — read as it is`].filter(Boolean).join('; ');
+  }
+  job.researching = false;
   if (!job.stable || job.stable.hash !== s.hash || job.stable.id !== s.last_assistant_id) {
     job.stable = { hash: s.hash, id: s.last_assistant_id, since: now };
     return;
@@ -559,6 +630,16 @@ async function pollJob(job) {
     sha256: createHash('sha256').update(markdown, 'utf8').digest('hex'),
     conversation_id: r.conversation_id || job.conversationId,
   };
+  // Where a research report did not come from rendered Markdown (UNVERIFIED report view / frames). Only for research
+  // replies: an ordinary reply may well embed a frame.
+  const notes = [];
+  const researchHint = researchSend || !!research?.completed;
+  if (r.source === 'frame') notes.push('the reply was read from a frame inside it');
+  if ((researchHint || researchReply) && r.source === 'text') {
+    notes.push('the reply has no readable Markdown (a report view or a cross-origin frame?) — saved its visible text; list_files / download_file may offer the report as an export');
+  }
+  if (researchHint && r.frames_unreadable) notes.push(`${r.frames_unreadable} frame(s) in the reply could not be read (cross-origin) — the report may be there; try list_files / download_file`);
+  if (notes.length) job.warning = [job.warning, ...notes].filter(Boolean).join('; ');
   if (job.saveTo) job.savedTo = await saveReply(job.saveTo, markdown, job.overwrite);
   finishJob(job);
 }
@@ -594,7 +675,10 @@ async function waitForJob(job, seconds) {
 
 function jobResult(job) {
   if (job.status === 'error') throw job.error;
-  if (job.status === 'running') return { complete: false, state: 'still_running', job_id: job.id, chars: job.chars, wait_command: waitCommand(job) };
+  if (job.status === 'running') {
+    // researching: Deep Research is still working (minutes to an hour) — run wait_command in the background.
+    return { complete: false, state: 'still_running', job_id: job.id, chars: job.chars, wait_command: waitCommand(job), ...(job.researching && { researching: true }) };
+  }
   const r = job.reply;
   const warning = job.warning ? { warning: job.warning } : {};
   if (job.savedTo) return { complete: true, saved_to: job.savedTo, chars: r.chars, sha256: r.sha256, ...warning };
@@ -811,11 +895,12 @@ function matchOption(options, wanted) {
   return null;
 }
 
-// Polls until more than `seen` items are visible (menus animate in), or returns what is there after 3 s.
-async function readMenu(site, seen) {
+// Polls until more than `seen` items are visible (menus animate in), or returns what is there after 3 s. `cmd` reads
+// the open menu: the model picker's, or the composer tools' ("tools_menu_read").
+async function readMenu(site, seen, cmd = 'model_menu_read') {
   let items = [];
   for (const end = Date.now() + 3_000; Date.now() < end; await sleep(MENU_POLL_MS)) {
-    ({ items } = await page(site, 'model_menu_read'));
+    ({ items } = await page(site, cmd));
     if (items.length > seen) break;
   }
   return items;
@@ -866,11 +951,12 @@ async function moveSlider(site, slider, wanted) {
   return { notFound: options.map((o) => o.label) };
 }
 
-async function closeModelMenu(site) {
+// which: "model" (the model picker) or "tools" (the composer's "+" menu).
+async function closeModelMenu(site, which = 'model') {
   for (const step of [null, 'escape', 'force']) {
-    if (step) await page(site, 'model_menu_close', { force: step === 'force' });
+    if (step) await page(site, `${which}_menu_close`, { force: step === 'force' });
     for (const end = Date.now() + 1_000; Date.now() < end; await sleep(MENU_POLL_MS)) {
-      if (!(await page(site, 'model_menu_read')).items.length) return true;
+      if (!(await page(site, `${which}_menu_read`)).items.length) return true;
     }
   }
   return false;
@@ -1025,6 +1111,211 @@ async function modeAfterOpen(site, conversationId, explicit) {
   const d = await ensureDefaultMode(site, fresh, { strict: false }).catch((e) => ({ mode: null, warning: `default mode not set: ${e.message}` }));
   if (d) return d.warning ? { mode: d.mode, warning: d.warning } : { mode: d.mode };
   return { mode: (await page(site, 'model_state').catch(() => null))?.mode ?? null };
+}
+
+// ---------------------------------------------------------------- composer tools (ChatGPT "+" menu: "Deep research" …)
+//
+// Live 2026-11-22: Deep Research is neither in the model picker nor a Chat / Work mode; it is expected (not yet seen —
+// the menu's contents were never read live) among the composer tools behind the "+" button left of the prompt
+// (aria-label "Add files and more", seen live). select_model { tool } / send_message { tool } press it there; get_status
+// / select_model report the tool that is on. Opt-in only: nothing ever turns a tool on by default, and a send without
+// `tool` asserts that none is on (toolGate). Items that add files are never pressed (they
+// open the OS file dialog). How a chosen tool shows in the composer is UNVERIFIED — a choice that cannot be confirmed
+// fails with TOOL_NOT_CONFIRMED rather than letting a message go out believed to be a research request.
+
+const NOT_A_TOOL = /photo|file|upload|image from|camera|照片|文件|上传|相机/i;
+const TOOL_OFF = /^(none|off|no tool|clear|关闭|无)$/i;
+const toolMatches = (shown, wanted) => {
+  const a = norm(shown);
+  const b = norm(wanted);
+  return !!a && !!b && (a === b || a.includes(b) || b.includes(a));
+};
+
+function rethrowToolsOutdated(e) {
+  if (e?.code === 'UNKNOWN_COMMAND') {
+    throw new ToolError('EXTENSION_OUTDATED', 'the extension predates composer tools (select_model { tool }) — reload it in chrome://extensions, then retry; nothing was pressed');
+  }
+  throw e;
+}
+
+// tool_state ({ tool, supported }); a content.js from before composer tools → EXTENSION_OUTDATED.
+const toolState = (site) => page(site, 'tool_state', {}, 10_000).catch(rethrowToolsOutdated);
+
+// Polls tool_state until `done(tool)` holds or MODE_WAIT_MS passes; returns the last tool seen.
+async function waitTool(site, done) {
+  let tool = null;
+  for (const end = Date.now() + MODE_WAIT_MS; ; await sleep(MENU_POLL_MS)) {
+    ({ tool } = await toolState(site));
+    if (done(tool) || Date.now() >= end) return tool;
+  }
+}
+
+// Opens the "+" menu and reads it, opening up to three submenus ("More") one at a time — all of them when only
+// listing, otherwise until the item is found: the one matching `wanted`, or (findSelected) the first tool shown as
+// selected. press: "match" presses it, "unlessSelected" only if it is not shown selected yet, "onlySelected" only if
+// it is, "never" never (submenu triggers are always pressed to open them). Always closes the menu.
+// Returns { tools: [{ label, description, selected, disabled, submenu, in }], hit, pressed, tree }.
+async function useToolsMenu(site, { wanted = null, findSelected = false, press = 'match', outline = false } = {}) {
+  await page(site, 'tools_menu_open').catch(rethrowToolsOutdated);
+  try {
+    let items = await readMenu(site, 0, 'tools_menu_read');
+    const tree = outline ? (await page(site, 'inspect', { selector: MENU_CONTAINERS, depth: 14, max_nodes: 400, visible_only: true }, 20_000)).tree : null;
+    if (!items.length) {
+      throw new ToolError(
+        'TOOLS_MENU_EMPTY',
+        `the composer "+" menu showed no readable items — fix the menu selectors in content.js${tree ? `; open menus:\n${tree}` : ' (select_model with outline: true shows the open menu)'}`,
+      );
+    }
+    const listed = items.map(({ index, ...o }) => ({ ...o, in: null }));
+    const usable = (list) => list.filter((i) => i.kind !== 'slider' && !NOT_A_TOOL.test(i.label));
+    const find = (list) => (wanted ? matchOption(usable(list), wanted) : findSelected ? usable(list).find((i) => !i.submenu && i.selected) ?? null : null);
+    let hit = find(items);
+    for (const sub of usable(items).filter((i) => i.submenu).slice(0, 3)) {
+      if (hit) break;
+      const cur = items.find((i) => i.submenu && i.label === sub.label);
+      if (!cur) continue;
+      await page(site, 'tools_menu_choose', { index: cur.index, label: cur.label });
+      const now = await readMenu(site, items.length, 'tools_menu_read');
+      const before = new Set(items.map((i) => i.label));
+      const fresh = now.filter((i) => !before.has(i.label));
+      listed.push(...fresh.map(({ index, ...o }) => ({ ...o, in: sub.label })));
+      items = now;
+      hit = find(fresh);
+    }
+    if (wanted && !hit) {
+      const offered = listed.filter((i) => !i.submenu && i.kind !== 'slider').map((i) => (i.in ? `${i.in} › ${i.label}` : i.label));
+      throw new ToolError('TOOL_NOT_FOUND', `no composer tool matches "${wanted}"; the "+" menu offers: ${offered.join(', ') || '(nothing)'} (items that add files are never pressed)`);
+    }
+    const go = !!hit && (press === 'match' || (press === 'unlessSelected' && !hit.selected) || (press === 'onlySelected' && hit.selected));
+    if (go) {
+      if (hit.disabled) throw new ToolError('TOOL_UNAVAILABLE', `"${hit.label}" is disabled here${hit.description ? ` (${hit.description})` : ''}`);
+      await page(site, 'tools_menu_choose', { index: hit.index, label: hit.label });
+      await sleep(500);
+    }
+    return { tools: listed, hit, pressed: go ? hit.label : null, tree };
+  } finally {
+    if (!(await closeModelMenu(site, 'tools').catch(() => false))) log(`[${site}] composer tools menu may still be open`);
+  }
+}
+
+// Server-side memory of the tool select_model / send_message turned on (siteState.toolChoice = { label, by }; by:
+// "composer" = the composer showed it, "menu" = only the "+" menu showed it selected, null = never confirmed). It is
+// what makes a default send (tool "none") refuse a tool the page cannot show — detecting the composer's tool is
+// UNVERIFIED — and survives navigation (whether a reload clears a tool is unknown too). Only a confirmed turn-off
+// (select_model { tool: "none" }) clears it — or the composer no longer showing a tool it did show.
+function reconcileTool(site, shown) {
+  const st = siteState[site];
+  if (st.toolChoice?.by === 'composer' && !shown) st.toolChoice = null;
+  if (shown) st.toolChoice = { label: shown, by: 'composer' };
+}
+
+// Turns `wanted` on (confirmed by the composer, or else by the "+" menu showing it selected), or with TOOL_OFF every
+// tool off. Returns { tool, confirmed_by?, tools?, tree?, warning? }.
+async function setTool(site, wanted, outline = false) {
+  const st = siteState[site];
+  const before = await toolState(site);
+  if (!before.supported) throw new ToolError('NOT_SUPPORTED', `composer tools (tool) are not supported on ${site} yet`);
+  reconcileTool(site, before.tool);
+  if (TOOL_OFF.test(wanted.trim())) return clearTool(site, before.tool);
+  if (before.tool && toolMatches(before.tool, wanted)) return { tool: before.tool, confirmed_by: 'composer' };
+  const used = await useToolsMenu(site, { wanted, press: 'unlessSelected', outline });
+  const label = used.hit.label;
+  let now = await waitTool(site, (t) => !!t && toolMatches(t, label));
+  let by = now && toolMatches(now, label) ? 'composer' : null;
+  if (!by) {
+    // Second signal: the "+" menu shows the item selected.
+    const check = await useToolsMenu(site, { wanted: label, press: 'never' }).catch(() => null);
+    if (check?.hit?.selected) by = 'menu';
+  }
+  st.toolChoice = { label: by === 'composer' ? now : label, by };
+  if (!by) {
+    throw new ToolError(
+      'TOOL_NOT_CONFIRMED',
+      `pressed "${label}" in the composer "+" menu, but neither the composer nor the menu shows it on (${now ? `the composer shows "${now}"` : 'no active tool seen'}) — the tab may or may not be in ${label}; nothing was sent. Look at the tab (show_tab); a default send_message now refuses (TOOL_MISMATCH) until select_model { tool: "none" }. If it is on, fix SELECTORS.toolPill in extension/content.js`,
+      { pressed: label, tool: now ?? null },
+    );
+  }
+  return { tool: st.toolChoice.label, confirmed_by: by, tools: used.tools, tree: used.tree };
+}
+
+async function clearTool(site, shown) {
+  const st = siteState[site];
+  const remembered = st.toolChoice?.label ?? null;
+  let why = null;
+  if (shown) {
+    const r = await page(site, 'tool_clear', {}, 10_000);
+    if (!(await waitTool(site, (t) => !t))) {
+      st.toolChoice = null;
+      return { tool: null };
+    }
+    why = r.reason || (r.pressed ? `pressed ${r.pressed}` : 'no remove control');
+  }
+  // The "+" menu: a tool shown selected there is pressed again (a checkbox item toggles off).
+  let menuError = null;
+  const m = await useToolsMenu(site, { findSelected: true, press: 'onlySelected' }).catch((e) => {
+    if (e.code === 'EXTENSION_OUTDATED') throw e;
+    menuError = e;
+    return { pressed: null };
+  });
+  if (m.pressed) {
+    const pill = await waitTool(site, (t) => !t);
+    const again = await useToolsMenu(site, { findSelected: true, press: 'never' }).catch(() => null);
+    if (!pill && !again?.hit) {
+      st.toolChoice = null;
+      return { tool: null };
+    }
+    why = `${why ? `${why}; ` : ''}pressed "${m.pressed}" in the "+" menu`;
+  }
+  const still = (await toolState(site)).tool;
+  if (still || m.pressed) {
+    throw new ToolError('TOOL_NOT_CLEARED', `could not turn "${still || m.pressed}" off (${why}); remove it by hand in the tab`, { tool: still || m.pressed });
+  }
+  st.toolChoice = null;
+  // Nothing on the page shows a tool, but one was turned on through this server and never seen going off.
+  const unread = menuError ? ` (the "+" menu could not be read: ${menuError.message})` : '';
+  return remembered || menuError
+    ? { tool: null, warning: `nothing on the page shows ${remembered ? `"${remembered}"` : 'a tool'} as on${unread}, so it is taken as off — detecting a chosen tool is unverified: if the tab still shows it, remove it by hand` }
+    : { tool: null };
+}
+
+// send_message's tool gate, before anything is typed. want "none" (the default): refuse with TOOL_MISMATCH when the
+// composer shows a tool, or one was turned on through this server and not turned off since — a leftover Deep research
+// must never turn a normal send into a research request (scarce quota). want a tool: it must be on already, or is
+// turned on here (and confirmed). Returns the tool the message goes out with, or null.
+async function toolGate(site, want) {
+  const off = TOOL_OFF.test(want.trim());
+  let ts;
+  try {
+    ts = await page(site, 'tool_state', {}, 10_000);
+  } catch (e) {
+    if (e?.code !== 'UNKNOWN_COMMAND') throw e;
+    if (off) return null; // content.js from before composer tools: nothing to check against
+    rethrowToolsOutdated(e);
+  }
+  if (!ts.supported) {
+    if (off) return null;
+    throw new ToolError('NOT_SUPPORTED', `composer tools ("tool") are not supported on ${site} yet; nothing was typed`);
+  }
+  reconcileTool(site, ts.tool);
+  const st = siteState[site];
+  if (off) {
+    const on = ts.tool ?? st.toolChoice?.label;
+    if (!on) return null;
+    const how = ts.tool ? `the composer has "${on}" on` : `"${on}" was turned on through this server${st.toolChoice.by ? '' : ' (never confirmed)'} and not turned off since`;
+    throw new ToolError(
+      'TOOL_MISMATCH',
+      `${how}, but this send asked for no tool (tool defaults to "none"); nothing was typed. Turn it off with select_model { tool: "none" } — or, to send with it, pass tool: "${on}"`,
+      { tool: on },
+    );
+  }
+  if (ts.tool && toolMatches(ts.tool, want)) return ts.tool;
+  if (st.toolChoice?.by === 'menu' && toolMatches(st.toolChoice.label, want)) return st.toolChoice.label;
+  // Turning it on presses the "+" menu: never while a reply or research runs (as select_model).
+  const snap = await page(site, 'snapshot', {}, 10_000);
+  if (snap.generating || snap.research?.active) {
+    throw new ToolError('STILL_GENERATING', `${snap.generating ? 'a reply is still being generated' : 'Deep Research still seems to be running'}; nothing was typed`);
+  }
+  return (await setTool(site, want)).tool;
 }
 
 // ---------------------------------------------------------------- projects (ChatGPT)
@@ -1222,13 +1513,15 @@ function safeName(name) {
 // other path is the file itself. Missing directories are created. The directory may be reached through symlinks
 // the caller named (macOS /tmp is one), but the file itself never is: an existing symlink there counts as an
 // existing file and is replaced, not written through, and the name cannot leave the directory.
+// name null (a report export, whose file name only the download tells): into a directory, the name is filled in by
+// nameTarget once the download is there.
 async function downloadTarget(saveTo, name, overwrite) {
   if (typeof saveTo !== 'string' || !path.isAbsolute(saveTo)) throw new ToolError('INVALID_ARGUMENT', '"save_to" must be an absolute directory or file path');
   const given = path.normalize(saveTo);
   const stat = await fs.stat(given).catch(() => null);
   const intoDir = !!stat?.isDirectory() || /[/\\]$/.test(saveTo);
   const dir = intoDir ? given : path.dirname(given);
-  const file = intoDir ? safeName(name) : path.basename(given);
+  const file = intoDir ? (name == null ? null : safeName(name)) : path.basename(given);
   let realDir;
   try {
     await fs.mkdir(dir, { recursive: true });
@@ -1236,9 +1529,16 @@ async function downloadTarget(saveTo, name, overwrite) {
   } catch (e) {
     throw new ToolError('SAVE_FAILED', `cannot use directory ${dir}: ${e.message}`);
   }
-  const target = { dir: realDir, file, path: path.join(realDir, file), shown: path.join(dir, file), overwrite };
-  await checkTarget(target);
+  const target = { dir: realDir, shownDir: dir, file, path: file && path.join(realDir, file), shown: file && path.join(dir, file), overwrite };
+  if (file) await checkTarget(target);
   return target;
+}
+
+async function nameTarget(target, name) {
+  target.file = safeName(name);
+  target.path = path.join(target.dir, target.file);
+  target.shown = path.join(target.shownDir, target.file);
+  await checkTarget(target);
 }
 
 async function checkTarget(target) {
@@ -1306,6 +1606,7 @@ async function saveCaptured(site, request, target, meta) {
   let failure = null;
   try {
     if (typeof d?.filename !== 'string' || !path.isAbsolute(d.filename)) throw new ToolError('DOWNLOAD_FAILED', 'the extension reported no file path for the download');
+    if (!target.file) await nameTarget(target, path.basename(d.filename));
     staged = await stageTarget(target, async (write) => {
       let fh;
       try {
@@ -1332,7 +1633,7 @@ async function saveCaptured(site, request, target, meta) {
   const discard = await bridgeRequest('download_discard', { download_id: d.download_id }, 15_000).catch((e) => ({ error: e }));
   if (failure) throw failure;
   await finishTarget(target, staged.tmp);
-  const out = { path: target.shown, size: staged.size, sha256: staged.sha256, name: meta.name, kind: meta.kind, via: meta.via, capture: d.capture, mime: d.mime ?? null };
+  const out = { path: target.shown, size: staged.size, sha256: staged.sha256, name: meta.name, kind: meta.kind, via: meta.via, capture: d.capture, mime: d.mime ?? null, ...(meta.format && { format: meta.format }) };
   if (discard.error || discard.removed === false) out.warning = `Chrome's copy ${d.filename} could not be removed (${discard.error?.message || 'still there'}) — delete it by hand`;
   return out;
 }
@@ -1375,6 +1676,40 @@ async function savePreview(site, chip, click, timing, target) {
     };
   } finally {
     await page(site, 'file_preview_close', { name: chip.name }).catch(() => {});
+  }
+}
+
+// A report's export control (kind "export", UNVERIFIED: Deep Research): pressed and caught like a chip; one that opens
+// a menu of formats gets `format` (or Markdown, else PDF, else Word, else the only one) chosen there instead.
+const EXPORT_SKIP = /copy|share|link|print|复制|分享|链接|打印/i;
+
+function pickFormat(items, format) {
+  const usable = items.filter((i) => !i.submenu && i.kind !== 'slider' && !i.disabled && !EXPORT_SKIP.test(i.label));
+  const offered = () => usable.map((i) => i.label).join(', ') || '(nothing that downloads)';
+  if (format) {
+    const hit = matchOption(usable, format);
+    if (!hit) throw new ToolError('FORMAT_NOT_FOUND', `the export menu has no format matching "${format}"; it offers: ${offered()}`);
+    return hit;
+  }
+  for (const re of [/markdown|\.md\b/i, /pdf/i, /word|docx/i]) {
+    const hit = usable.find((i) => re.test(i.label));
+    if (hit) return hit;
+  }
+  if (usable.length === 1) return usable[0];
+  throw new ToolError('FORMAT_NOT_FOUND', `pass "format": the export menu offers ${offered()}`);
+}
+
+async function saveExport(site, chip, click, timing, target, format) {
+  const meta = { name: chip.name, kind: 'export', via: 'export' };
+  if (!chip.menu) return saveCaptured(site, { cmd: 'file_click', args: click, name: chip.name, ...timing }, target, meta);
+  await page(site, 'file_click', click);
+  try {
+    const items = await readMenu(site, 0);
+    if (!items.length) throw new ToolError('EXPORT_MENU_EMPTY', `pressed "${chip.label || chip.name}" but no menu of formats appeared — fix exportControl / exportLabel in extension/content.js`);
+    const hit = pickFormat(items, format);
+    return await saveCaptured(site, { cmd: 'model_menu_choose', args: { index: hit.index, label: hit.label }, name: chip.name, ...timing }, target, { ...meta, format: hit.label });
+  } finally {
+    await closeModelMenu(site).catch(() => {});
   }
 }
 
@@ -1426,7 +1761,7 @@ const TOOLS = [
   {
     name: 'get_status',
     description:
-      'Non-blocking snapshot of a site\'s MCP tab: { site, state: "idle" | "thinking" | "streaming" | "done" | "error", conversation_id, mode, chars, uploading, tab_hidden, has_reply, last_role, mcp_tab_open, page_stale, last_send?, warning? }. mode = the selected Chat / Task (Gemini) or Chat / Work (ChatGPT) mode, null where the page shows none (Gemini shows its toggle on new chats only). page_stale=true (with a warning saying why) means the page may show another conversation than its URL says — e.g. after the tab was switched by hand — and reads are refused with PAGE_STALE until open_conversation. tab_hidden=true means Chrome treats the tab as not visible (background tab, minimized or covered window). has_reply=true means an assistant reply follows the latest user message (get_latest_reply can read it). last_send = { sent_at, observed } for the last send_message on this site: observed=false means its text has not been seen on the page (null: page unreadable). Read-only.',
+      'Non-blocking snapshot of a site\'s MCP tab: { site, state: "idle" | "thinking" | "streaming" | "done" | "error", conversation_id, mode, tool, research_active, chars, uploading, tab_hidden, has_reply, last_role, mcp_tab_open, page_stale, last_send?, warning? }. mode = the selected Chat / Task (Gemini) or Chat / Work (ChatGPT) mode, null where the page shows none (Gemini shows its toggle on new chats only). tool = the composer tool that is on (ChatGPT "+" menu, e.g. "Deep research"), else null. research_active=true: the current reply shows Deep Research still working (state is then "thinking" / "streaming"). page_stale=true (with a warning saying why) means the page may show another conversation than its URL says — e.g. after the tab was switched by hand — and reads are refused with PAGE_STALE until open_conversation. tab_hidden=true means Chrome treats the tab as not visible (background tab, minimized or covered window). has_reply=true means an assistant reply follows the latest user message (get_latest_reply can read it). last_send = { sent_at, observed } for the last send_message on this site: observed=false means its text has not been seen on the page (null: page unreadable). Read-only.',
     inputSchema: { type: 'object', properties: { site: SITE_PROPERTY }, additionalProperties: false },
     annotations: { readOnlyHint: true },
   },
@@ -1456,7 +1791,7 @@ const TOOLS = [
   {
     name: 'send_message',
     description:
-      'Type the text verbatim into the composer of the MCP tab and click Send exactly once. Fails with CONVERSATION_MISMATCH (nothing typed) when expect_conversation_id does not match the tab — "new" (or https://chatgpt.com/ / https://gemini.google.com/app) asserts an empty new chat —, STILL_GENERATING while a reply is in progress, TAB_HIDDEN (nothing typed) when the tab is hidden and on_hidden says so (Gemini default: bring it forward first, fail only if it stays hidden), MODE_NOT_SET (nothing typed) when a new Gemini chat cannot be put in its default Task mode (choose a mode explicitly with select_model to go ahead without it; an explicit choice is never switched back), PAGE_STALE (nothing typed) while the page may show another conversation than its URL (see get_status). Never retried automatically — after any failure check get_status instead of re-sending. confirmed=false comes with a warning: the click was delivered and may still go out (Gemini holds a clicked Send while the tab is hidden, in Chat and Task mode alike), so never send again; a further send_message is refused with SEND_PENDING while that text is still in the composer. Returns { sent, confirmed, conversation_id, tab_shown?, mode?, warning? } (mode: the mode a new chat went out in).',
+      'Type the text verbatim into the composer of the MCP tab and click Send exactly once. Fails with CONVERSATION_MISMATCH (nothing typed) when expect_conversation_id does not match the tab — "new" (or https://chatgpt.com/ / https://gemini.google.com/app) asserts an empty new chat —, STILL_GENERATING while a reply is in progress, TAB_HIDDEN (nothing typed) when the tab is hidden and on_hidden says so (Gemini default: bring it forward first, fail only if it stays hidden), MODE_NOT_SET (nothing typed) when a new Gemini chat cannot be put in its default Task mode (choose a mode explicitly with select_model to go ahead without it; an explicit choice is never switched back), PAGE_STALE (nothing typed) while the page may show another conversation than its URL (see get_status), TOOL_MISMATCH (nothing typed) when a composer tool is on that `tool` did not ask for (default "none": a leftover Deep research never turns a normal send into a research request). Never retried automatically — after any failure check get_status instead of re-sending. confirmed=false comes with a warning: the click was delivered and may still go out (Gemini holds a clicked Send while the tab is hidden, in Chat and Task mode alike), so never send again; a further send_message is refused with SEND_PENDING while that text is still in the composer. Returns { sent, confirmed, conversation_id, tab_shown?, mode?, tool?, warning? } (mode: the mode a new chat went out in; tool: the composer tool it went out with).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1464,6 +1799,12 @@ const TOOLS = [
         expect_conversation_id: {
           type: 'string',
           description: 'conversation id or URL the tab must currently show; "new" or the site\'s new-chat URL (https://chatgpt.com/, https://gemini.google.com/app) = the tab must be on an empty new chat (no conversation id, no messages)',
+        },
+        tool: {
+          type: 'string',
+          default: 'none',
+          description:
+            'composer tool this message must go out with: "none" (default) = no tool may be on — TOOL_MISMATCH, nothing typed, if the composer shows one or one was turned on through this server and not turned off since; "Deep research" (ChatGPT) = it must be on or is turned on (and confirmed) first. Deep Research is opt-in only and its quota is scarce',
         },
         on_hidden: ON_HIDDEN_PROPERTY,
         site: SITE_PROPERTY,
@@ -1475,7 +1816,7 @@ const TOOLS = [
   {
     name: 'get_latest_reply',
     description:
-      'Wait (≤ min(wait_seconds, 45) s, polling every 2 s) for the latest assistant reply in the MCP tab to finish: no stop button and text unchanged for 2 s. If still running, returns { complete: false, state: "still_running", job_id, chars, wait_command } and keeps polling in the background. Long replies (e.g. ChatGPT Pro, Gemini Task): run wait_command as a background shell task (Claude Code: Bash with run_in_background) — it blocks at no cost and exits when the reply is done, failed or orphaned, which wakes you; then call get_job once. Otherwise continue with get_job. When complete: with save_to (absolute path; never overwrites unless overwrite=true, adds -1, -2 … instead) returns only { complete: true, saved_to, chars, sha256 }; without it returns { complete: true, conversation_id, chars, sha256 } followed by the Markdown as a second text block. After a SEND_NOT_OBSERVED error, the next call reads the latest reply on the page as it is and adds a warning that it may predate the sent message. PAGE_STALE (nothing read or saved): the tab was seen on another conversation since the last send (e.g. switched by hand), or its latest user message is no longer the one sent — the page may show another conversation than its URL; call open_conversation, then retry. expect_conversation_id → CONVERSATION_MISMATCH (nothing read) if the tab shows another conversation.',
+      'Wait (≤ min(wait_seconds, 45) s, polling every 2 s) for the latest assistant reply in the MCP tab to finish: no stop button and text unchanged for 2 s. If still running, returns { complete: false, state: "still_running", job_id, chars, wait_command, researching? } and keeps polling in the background (researching=true: Deep Research is still working — it can take up to an hour). Long replies (e.g. ChatGPT Pro, Gemini Task): run wait_command as a background shell task (Claude Code: Bash with run_in_background) — it blocks at no cost and exits when the reply is done, failed or orphaned, which wakes you; then call get_job once. Otherwise continue with get_job. When complete: with save_to (absolute path; never overwrites unless overwrite=true, adds -1, -2 … instead) returns only { complete: true, saved_to, chars, sha256 }; without it returns { complete: true, conversation_id, chars, sha256 } followed by the Markdown as a second text block. After a SEND_NOT_OBSERVED error, the next call reads the latest reply on the page as it is and adds a warning that it may predate the sent message. PAGE_STALE (nothing read or saved): the tab was seen on another conversation since the last send (e.g. switched by hand), or its latest user message is no longer the one sent — the page may show another conversation than its URL; call open_conversation, then retry. A job ended by a moved tab (CONVERSATION_CHANGED / PAGE_STALE with tab_moved: true, conversation_id, recovery; wait_command exits 4) lost nothing: open_conversation on that conversation_id, then get_latest_reply — never send again. Deep Research: the job stays still_running while the research runs; a clarifying question completes like any reply. expect_conversation_id → CONVERSATION_MISMATCH (nothing read) if the tab shows another conversation.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1505,13 +1846,14 @@ const TOOLS = [
   {
     name: 'select_model',
     description:
-      'Switch the model and/or mode of a site\'s MCP tab, or just list them. mode presses the button of the composer\'s mode toggle whose text matches (ChatGPT: "Chat" / "Work"; Gemini: "Chat" / "Task", shown on new chats only). model opens the model picker and clicks the option whose label matches, descending into submenus when needed. Matching is case-insensitive: exact, then prefix, then substring; an ambiguous match is refused and nothing is clicked. Without model it only lists the picker\'s options. New Gemini chats get Task mode by default (also applied here when model is given without mode); an explicit mode wins over that default until the next open_conversation and is never switched back. Use it before send_message; refused while a reply is generating. Returns { site, model, mode, modes, models: [{ label, description, selected, disabled, submenu }], warning? }.',
+      'Switch the model and/or mode of a site\'s MCP tab, or just list them. mode presses the button of the composer\'s mode toggle whose text matches (ChatGPT: "Chat" / "Work"; Gemini: "Chat" / "Task", shown on new chats only). model opens the model picker and clicks the option whose label matches, descending into submenus when needed. Matching is case-insensitive: exact, then prefix, then substring; an ambiguous match is refused and nothing is clicked. Without model it only lists the picker\'s options. New Gemini chats get Task mode by default (also applied here when model is given without mode); an explicit mode wins over that default until the next open_conversation and is never switched back. tool turns on a composer tool of ChatGPT\'s "+" menu ("Add files and more") by its text — e.g. "Deep research" (opt-in only; it is neither a model nor a mode) — descending into submenus such as "More"; tool "none" turns every tool off. The result is checked on the page (the composer, else the menu showing it selected): TOOL_NOT_CONFIRMED otherwise (then look at the tab; default sends refuse with TOOL_MISMATCH until tool "none"). Items that add files or photos are never pressed. A call without model / mode / tool also lists the "+" menu as tools (never failing because of it: tools null + warning). With only tool, the model picker is not opened (models: null). Use it before send_message; refused while a reply is generating or Deep Research runs. Returns { site, model, mode, modes, models: [{ label, description, selected, disabled, submenu }], tool, tool_confirmed_by?, tools?: [{ label, description, selected, disabled, submenu, in }], warning? } (tool: the active composer tool or null; tool_confirmed_by: "composer" | "menu"; in: the submenu an item sits in).',
     inputSchema: {
       type: 'object',
       properties: {
         model: { type: 'string', description: 'text of the model option, e.g. "Pro", "Thinking"' },
         mode: { type: 'string', description: 'text of the mode button, e.g. "Task", "Work", "Chat"' },
-        outline: { type: 'boolean', default: false, description: 'also return a DOM outline of the open model menu (for fixing selectors)' },
+        tool: { type: 'string', description: 'ChatGPT composer tool from the "+" menu to turn on, e.g. "Deep research"; "none" turns the active tool off' },
+        outline: { type: 'boolean', default: false, description: 'also return a DOM outline of the open model menu (and of the "+" menu when tools are read) (for fixing selectors)' },
         site: SITE_PROPERTY,
       },
       additionalProperties: false,
@@ -1520,7 +1862,7 @@ const TOOLS = [
   {
     name: 'list_files',
     description:
-      'List the files offered for download in an assistant reply of the MCP tab (ChatGPT shows them as inline chips, e.g. generated .patch / .md files). Returns { site, supported, conversation_id, message, replies, current, generating, files: [{ index, name, kind, label }] }: kind "download" is a direct download chip, "preview" opens a preview panel; index tells files of the same name apart. message: "latest" (default) or how many replies back (0 = latest; long ChatGPT threads keep only the latest turn in the page). current=false means the latest message is the user\'s, so this reply precedes it. Gemini: supported=false and no files. PAGE_STALE: see get_status. Clicks nothing; read-only.',
+      'List the files offered for download in an assistant reply of the MCP tab (ChatGPT shows them as inline chips, e.g. generated .patch / .md files). Returns { site, supported, conversation_id, message, replies, current, generating, files: [{ index, name, kind, label }] }: kind "download" is a direct download chip, "preview" opens a preview panel, "export" is a report\'s export / download control (Deep Research, UNVERIFIED; menu=true: it offers formats, see download_file format); index tells files of the same name apart. message: "latest" (default) or how many replies back (0 = latest; long ChatGPT threads keep only the latest turn in the page). current=false means the latest message is the user\'s, so this reply precedes it. Gemini: supported=false and no files. PAGE_STALE: see get_status. Clicks nothing; read-only.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1534,7 +1876,7 @@ const TOOLS = [
   {
     name: 'download_file',
     description:
-      'Save a file from an assistant reply (see list_files) to a local path. Presses its chip in the MCP tab, catches the browser download it starts (or, if the page is held back, fetches the URL the page tried to open), copies the file to save_to and deletes Chrome\'s own copy (only that download) from the Downloads folder and the download list. A preview chip opens its panel and uses the panel\'s download button; without one, the text the panel shows is saved with via: "preview-text" and a warning (not byte-exact). Sends no message. Pick the file by name or index (from list_files), or both, which must then agree: name must equal the file name exactly; a name shown more than once → AMBIGUOUS_FILE (pass index); neither → INVALID_ARGUMENT. save_to: absolute directory (the file keeps its name) or file path; an existing file → FILE_EXISTS unless overwrite=true; symlinks at the target are replaced, never written through. Returns { path, size, sha256, name, kind, via: "download" | "preview-download" | "preview-text", capture?, mime?, warning? }. Errors: FILE_NOT_IN_REPLY, AMBIGUOUS_FILE, FILE_EXISTS, DOWNLOAD_NOT_STARTED, DOWNLOAD_PROMPTED (Chrome asks where to save), DOWNLOAD_TIMEOUT, DOWNLOAD_FAILED, NOT_SUPPORTED (Gemini), PAGE_STALE (see get_status; nothing pressed).',
+      'Save a file from an assistant reply (see list_files) to a local path. Presses its chip in the MCP tab, catches the browser download it starts (or, if the page is held back, fetches the URL the page tried to open), copies the file to save_to and deletes Chrome\'s own copy (only that download) from the Downloads folder and the download list. A preview chip opens its panel and uses the panel\'s download button; without one, the text the panel shows is saved with via: "preview-text" and a warning (not byte-exact). An export entry (a report\'s export control) is pressed — choosing `format` in its menu if it has one (default: Markdown, else PDF, else Word) — and saved under the downloaded file\'s name when save_to is a directory (via: "export"). Sends no message. Pick the file by name or index (from list_files), or both, which must then agree: name must equal the file name exactly; a name shown more than once → AMBIGUOUS_FILE (pass index); neither → INVALID_ARGUMENT. save_to: absolute directory (the file keeps its name) or file path; an existing file → FILE_EXISTS unless overwrite=true; symlinks at the target are replaced, never written through. Returns { path, size, sha256, name, kind, via: "download" | "preview-download" | "preview-text" | "export", capture?, mime?, format?, warning? }. Errors: FILE_NOT_IN_REPLY, AMBIGUOUS_FILE, FILE_EXISTS, FORMAT_NOT_FOUND, DOWNLOAD_NOT_STARTED, DOWNLOAD_PROMPTED (Chrome asks where to save), DOWNLOAD_TIMEOUT, DOWNLOAD_FAILED, NOT_SUPPORTED (Gemini), PAGE_STALE (see get_status; nothing pressed).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1544,6 +1886,7 @@ const TOOLS = [
         index: { type: 'integer', minimum: 0, description: 'index from list_files: picks the file on its own, or one of several files with the same name together with name' },
         overwrite: { type: 'boolean', default: false },
         timeout_seconds: { type: 'number', default: DOWNLOAD_TIMEOUT_S, description: 'how long the download may take (2–600 s)' },
+        format: { type: 'string', description: 'export entries only: the format to pick in the export menu, e.g. "PDF", "Markdown", "Word"' },
         site: SITE_PROPERTY,
       },
       required: ['save_to'],
@@ -1600,6 +1943,17 @@ const handlers = {
       // Whether the last send_message's text has been seen on the page (null: the page is unreadable).
       out.last_send = { sent_at: new Date(pending.sentAt).toISOString(), observed: pending.observed || (s ? sendObserved(pending, s) : null) };
     }
+    // Composer tool and Deep Research (content.js from before them: null / false). A progress indicator alone counts
+    // as research only after a research send (see pollJob).
+    // A tool confirmed only by the "+" menu (or pressed but never confirmed) is not seen in the composer: report it.
+    if ('tool' in out) {
+      reconcileTool(site, out.tool);
+      out.tool = out.tool ?? siteState[site].toolChoice?.label ?? null;
+    } else out.tool = null; // content.js from before composer tools
+    const researching = !!out.research_active || (!!out.research_progress && (isResearchTool(pending?.tool) || recentResearch(site, out.conversation_id)));
+    delete out.research_progress;
+    out.research_active = researching;
+    if (researching && (out.state === 'done' || out.state === 'idle')) out.state = 'thinking';
     const stale = staleReason(site, s);
     out.page_stale = !!stale;
     if (stale) out.warning = `${stale} — get_latest_reply / list_files / download_file / send_message / upload_files refuse with PAGE_STALE until open_conversation reloads the page`;
@@ -1667,6 +2021,8 @@ const handlers = {
     const text = requireString(args, 'text');
     const expected = args.expect_conversation_id ? toConversationId(String(args.expect_conversation_id), site) : null;
     const onHidden = optOnHidden(args, site);
+    // Composer tool for this message: "none" (default) asserts that no tool is on; Deep Research is opt-in only.
+    const wantTool = args.tool == null ? 'none' : requireString(args, 'tool');
     ensureConnected();
     const st = siteState[site];
     const prev = st.pendingSend;
@@ -1686,6 +2042,9 @@ const handlers = {
     assertFresh(site, null, 'Nothing was typed');
     // A wrong conversation is refused before the tab is brought forward; fill_composer checks again.
     if (s) checkConversation(s, expected);
+    // The composer tool, before the tab is touched: TOOL_MISMATCH (nothing typed) for a tool that was not asked for;
+    // a requested one must be on or is turned on (and confirmed) here.
+    const gateTool = await toolGate(site, wantTool);
     const shown = await ensureVisible(site, onHidden, s, 'typed');
     // A new chat goes out in the default mode (Gemini: Task) — switched after the tab is shown, before typing.
     const mode = await ensureDefaultMode(site, s, { strict: true, done: 'typed' });
@@ -1711,7 +2070,9 @@ const handlers = {
     cancelActiveJob(site, 'SUPERSEDED', 'a new message was sent');
     const pending = (st.pendingSend = {
       baseline: filled.baseline, sentAt: Date.now(), confirmed: false, observed: false, unobserved: false, conversationId: filled.conversation_id ?? null, hashSeen: false,
+      tool: gateTool ?? filled.tool ?? null, // the composer tool it went out with ("Deep research" → long research job)
     });
+    if (isResearchTool(pending.tool)) st.lastResearch = pending;
     st.attached = false; // the attachments went out with it
     let confirmed = false;
     let conversationId = filled.conversation_id;
@@ -1726,7 +2087,7 @@ const handlers = {
       confirmed = sendObserved(pending, s);
     }
     pending.confirmed = confirmed;
-    const tabShown = { ...(shown && { tab_shown: true }), ...(mode && { mode: mode.mode }) };
+    const tabShown = { ...(shown && { tab_shown: true }), ...(mode && { mode: mode.mode }), ...(pending.tool && { tool: pending.tool }) };
     if (confirmed) return { sent: true, confirmed, conversation_id: conversationId, ...tabShown };
     return {
       sent: true,
@@ -1782,10 +2143,11 @@ const handlers = {
     const site = resolveSite(args);
     const model = args.model == null ? null : requireString(args, 'model');
     const mode = args.mode == null ? null : requireString(args, 'mode');
+    const tool = args.tool == null ? null : requireString(args, 'tool');
     ensureConnected();
     const snap = await page(site, 'snapshot', {}, 10_000);
-    if (snap.generating) {
-      throw new ToolError('STILL_GENERATING', 'a reply is still being generated; switch model or mode after it finishes');
+    if (snap.generating || snap.research?.active) {
+      throw new ToolError('STILL_GENERATING', `${snap.generating ? 'a reply is still being generated' : 'Deep Research still seems to be running'}; switch model, mode or tool after it finishes`);
     }
     notePage(site, snap.conversation_id, snap);
 
@@ -1816,9 +2178,34 @@ const handlers = {
     }
 
     const outline = optBool(args, 'outline', false);
-    const first = await useModelMenu(site, model, outline);
+    // With only `tool`, the model picker is left alone (models: null).
+    const first = model || !tool ? await useModelMenu(site, model, outline) : null;
     // Re-read after a change so `models` shows what the page now has selected, not the pre-click state.
     const menu = model ? await useModelMenu(site, null) : first;
+    // Composer tools ("+" menu): `tool` turns one on (or "none" off) after the model and mode; a plain listing lists
+    // them too but never fails because of them. tools stays undefined (left out) when not read.
+    let tools;
+    let toolTree = null;
+    let chosen = null;
+    if (tool) {
+      chosen = await setTool(site, tool, outline);
+      tools = chosen.tools;
+      toolTree = chosen.tree ?? null;
+      if (chosen.warning) warning = [warning, chosen.warning].filter(Boolean).join('; ');
+    } else if (!model && !mode) {
+      try {
+        if ((await toolState(site)).supported) {
+          const u = await useToolsMenu(site, { outline });
+          tools = u.tools;
+          toolTree = u.tree;
+        } else {
+          tools = null;
+        }
+      } catch (e) {
+        tools = null;
+        warning = [warning, `composer tools not listed: ${e.message}`].filter(Boolean).join('; ');
+      }
+    }
     const st = await page(site, 'model_state');
     const result = {
       site,
@@ -1826,9 +2213,14 @@ const handlers = {
       mode: st.mode,
       modes: st.modes?.map((m) => m.label) ?? [],
       models: menu?.items.map(({ index, ...option }) => option) ?? null,
+      // A tool confirmed only by the "+" menu is not seen in the composer: report what was confirmed.
+      tool: chosen ? chosen.tool : (st.tool ?? null),
+      ...(chosen?.confirmed_by && { tool_confirmed_by: chosen.confirmed_by }),
+      ...(tools !== undefined && { tools }),
       ...(warning && { warning }),
     };
-    return outline ? withText(result, first?.tree || '(no open menu found)') : result;
+    const trees = [first?.tree && `model menu:\n${first.tree}`, toolTree && `composer "+" menu:\n${toolTree}`].filter(Boolean);
+    return outline ? withText(result, trees.join('\n\n') || '(no open menu found)') : result;
   },
 
   async list_files(args) {
@@ -1848,6 +2240,7 @@ const handlers = {
     if (name == null && index == null) throw new ToolError('INVALID_ARGUMENT', 'pass "name" (the exact file name) or "index" (from list_files), or both; nothing was pressed');
     const overwrite = optBool(args, 'overwrite', false);
     const timeoutS = optNumber(args, 'timeout_seconds', DOWNLOAD_TIMEOUT_S, 2, 600);
+    const format = args.format == null ? null : requireString(args, 'format');
     if (typeof args.save_to !== 'string' || !path.isAbsolute(args.save_to)) throw new ToolError('INVALID_ARGUMENT', '"save_to" must be an absolute directory or file path');
     ensureConnected();
     return oneDownloadAtATime(async () => {
@@ -1855,11 +2248,13 @@ const handlers = {
       await assertFreshListing(site, listing, 'Nothing was pressed or downloaded');
       if (!listing.supported) throw new ToolError('NOT_SUPPORTED', `downloading reply files is not supported on ${site} yet`);
       const chip = pickFile(listing.files, name, index);
-      // Checked before anything is pressed: a bad or taken target downloads nothing.
-      const target = await downloadTarget(args.save_to, chip.name, overwrite);
+      // Checked before anything is pressed: a bad or taken target downloads nothing (an export into a directory takes
+      // the downloaded file's name, checked once it is known).
+      const target = await downloadTarget(args.save_to, chip.kind === 'export' ? null : chip.name, overwrite);
       const timing = { timeout_ms: timeoutS * 1000, ...DOWNLOAD_PHASES };
       const click = { message: listing.message, index: chip.index, name: chip.name };
       if (chip.kind === 'preview') return savePreview(site, chip, click, timing, target);
+      if (chip.kind === 'export') return saveExport(site, chip, click, timing, target, format);
       return saveCaptured(site, { cmd: 'file_click', args: click, name: chip.name, ...timing }, target, { name: chip.name, kind: chip.kind, via: 'download' });
     });
   },
@@ -1885,7 +2280,9 @@ const handlers = {
 
 const INSTRUCTIONS = `Drives ChatGPT (chatgpt.com) and Gemini (gemini.google.com) in one dedicated tab per site of the user's everyday Chrome.
 Flow: open_conversation → (select_model) → (upload_files) → send_message → get_latest_reply.
-If get_latest_reply returns still_running, do not keep calling get_job every 45 s: run its wait_command as a background shell task (Claude Code: Bash with run_in_background: true). It prints one line of JSON and exits when the reply is done (exit 0), failed (1), orphaned because the server restarted (2) or after 4 h (3); you are woken when it exits. Then call get_job once (it returns immediately). Meanwhile you can keep working or answer the user.
+If get_latest_reply returns still_running, do not keep calling get_job every 45 s: run its wait_command as a background shell task (Claude Code: Bash with run_in_background: true). It prints one line of JSON and exits when the reply is done (exit 0), failed (1), orphaned because the server restarted (2), after 4 h (3), or because the MCP tab was moved to another conversation (4, status "tab_moved" — e.g. switched by hand); you are woken when it exits. Then call get_job once (it returns immediately). Meanwhile you can keep working or answer the user.
+Exit 4 / tab_moved (CONVERSATION_CHANGED or PAGE_STALE with tab_moved: true): nothing is lost and the message must NOT be sent again — call open_conversation with the printed conversation_id, then get_latest_reply (save_to recommended). The MCP tab is titled "[MCP] …" so the user can tell it apart.
+ChatGPT Deep Research is OPT-IN only and never turned on by default: use it only when the user asks for it. It is not a model or a mode but (expected, not yet confirmed live) a tool of the composer's "+" menu: send_message { tool: "Deep research" } (or select_model { tool: "Deep research" } first) turns it on; select_model { tool: "none" } turns it off; select_model without arguments lists the tools; get_status shows tool and research_active. Every send_message without tool asserts that no tool is on (TOOL_MISMATCH, nothing typed, otherwise), so a leftover Deep research never spends its scarce quota on a normal message — never send just to test it. It may first ask clarifying questions (a normal reply — answer with send_message { tool: "Deep research" } while the tool still shows as on; whether the answer must carry the tool is unverified); the research itself runs minutes to an hour: get_latest_reply stays still_running (researching: true), so use wait_command. A report that offers an export shows up in list_files as kind "export".
 select_model switches the model ("Pro", "Thinking", …) and mode (ChatGPT "Work", Gemini "Task" — on a new chat) by the text shown in the page; call it without arguments to list the options. New Gemini chats are put in Task mode by default (open_conversation, and checked again before upload_files / send_message: MODE_NOT_SET, nothing typed, if it cannot be set); an explicit mode ("Chat") wins until the next open_conversation.
 Every tool takes an optional site ("chatgpt" | "gemini"), defaulting to the site of the most recent open_conversation; pass it explicitly when working with both sites at once.
 Prefer save_to for long replies so the full text stays out of context.

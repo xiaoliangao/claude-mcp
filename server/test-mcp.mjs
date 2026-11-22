@@ -21,6 +21,14 @@
 //      MODE_NOT_SET rather than another mode); an explicit mode is never switched back; existing chats untouched;
 //  10. a stale page (URL of conversation A, messages of another one — 2026-11-22): PAGE_STALE instead of a silent
 //      save_to, until open_conversation reloads the page.
+//  11. ChatGPT composer tools / Deep Research (opt-in): select_model lists the "+" menu (submenus included) and turns a
+//      tool on or off, confirmed by the composer or the menu (TOOL_NOT_CONFIRMED otherwise), never pressing an item
+//      that adds files; a send without `tool` refuses any tool that is on or was turned on and not off (TOOL_MISMATCH,
+//      nothing typed); send_message { tool } turns it on; get_status shows the tool; a research reply stays
+//      still_running while the research runs (or shows no report text yet), also after a tab-moved reopen; a
+//      clarifying question completes at once; a report export is downloaded in the chosen format;
+//  12. a tab moved to another conversation mid-reply (2026-11-22): the job ends with tab_moved + the conversation to
+//      reopen, wait-job.mjs exits 4, and reopening + get_latest_reply recovers the reply without a resend.
 // Usage: node server/test-mcp.mjs [--port 17373]
 import { spawn } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
@@ -44,6 +52,7 @@ const SEND_NOT_OBSERVED_MS = 5_000; // 60 s in production
 const UPLOAD_ATTACH_MS = 1_200; // 6 s in production
 const SHOW_TAB_MS = 600; // 3 s in production
 const MODE_WAIT_MS = 600; // 3 s in production
+const RESEARCH_QUIET_MS = 3_000; // 15 min in production
 // download capture phases in background.js (production: 6 s / 20 s / 8 s)
 const DOWNLOAD_NATIVE_MS = 600;
 const DOWNLOAD_START_MS = 1_500;
@@ -84,7 +93,7 @@ const child = spawn(process.execPath, [path.join(HERE, 'server.mjs')], {
   stdio: ['pipe', 'pipe', 'pipe'],
   env: { ...process.env, CHATGPT_BRIDGE_PORT: String(PORT), CHATGPT_BRIDGE_JOBS_DIR: JOBS_DIR, CHATGPT_BRIDGE_SEND_NOT_OBSERVED_MS: String(SEND_NOT_OBSERVED_MS), CHATGPT_BRIDGE_UPLOAD_ATTACH_MS: String(UPLOAD_ATTACH_MS),
     CHATGPT_BRIDGE_DOWNLOAD_NATIVE_MS: String(DOWNLOAD_NATIVE_MS), CHATGPT_BRIDGE_DOWNLOAD_START_MS: String(DOWNLOAD_START_MS), CHATGPT_BRIDGE_DOWNLOAD_PROMPT_MS: String(DOWNLOAD_PROMPT_MS),
-    CHATGPT_BRIDGE_SHOW_TAB_MS: String(SHOW_TAB_MS), CHATGPT_BRIDGE_MODE_WAIT_MS: String(MODE_WAIT_MS) },
+    CHATGPT_BRIDGE_SHOW_TAB_MS: String(SHOW_TAB_MS), CHATGPT_BRIDGE_MODE_WAIT_MS: String(MODE_WAIT_MS), CHATGPT_BRIDGE_RESEARCH_QUIET_MS: String(RESEARCH_QUIET_MS) },
 });
 
 // Runs wait-job.mjs the way a client would in the background; resolves with its exit code and JSON line.
@@ -177,6 +186,23 @@ Object.assign(fake, { hidden: false, show: 'ok', showLegacy: false, newChat: fal
 // `conv`: the conversation id the page reports (URL). Gemini's Chat / Task toggle (`gem`) shows on new chats only:
 // `toggle` whether it renders, `sticks` whether a press takes, `presses` what was pressed.
 Object.assign(fake, { conv: 'conv-test', gem: { mode: 'Chat', toggle: true, sticks: true, presses: [] } });
+// Composer tools ("+" menu) like ChatGPT's (live 2026-11-22: Deep research is not in the model menu; expected here, menu contents not yet seen): an item
+// that adds files (never to be pressed), Deep research, a "More" submenu. `sticks`: a press shows the tool in the
+// composer; `clearWorks`: the pill's remove control works; `legacy`: a content.js from before composer tools.
+// fake.research: what content.js researchState reports for the current reply; convWhileGenerating: the page keeps its
+// real conversation id while generating (instead of a temporary local- id).
+// `pill`: content.js recognises the active tool in the composer (UNVERIFIED live); `menuSelected`: the "+" menu shows
+// the active tool as selected.
+const tools = { active: null, open: false, sub: false, pressed: [], sticks: true, clearWorks: true, legacy: false, pill: true, menuSelected: true };
+const shownTool = () => (tools.pill ? tools.active : null);
+const TOOL_TOP = [{ label: 'Add photos & files' }, { label: 'Deep research', description: 'Get a detailed report' }, { label: 'Create image' }, { label: 'More', submenu: true }];
+const TOOL_MORE = [{ label: 'Web search' }, { label: 'Canvas' }];
+const toolItems = () =>
+  tools.open
+    ? [...TOOL_TOP, ...(tools.sub ? TOOL_MORE : [])].map((t, index) => ({ index, label: t.label, description: t.description ?? null, selected: tools.menuSelected && t.label === tools.active, disabled: false, submenu: !!t.submenu }))
+    : [];
+const NO_RESEARCH = { active: false, progress: false, completed: false, frame: false, label: null, hash: 'r0' };
+Object.assign(fake, { research: NO_RESEARCH, convWhileGenerating: false, extract: {}, exportMenu: null });
 const SHOW_REASONS = {
   minimized: 'its window is still minimized',
   unfocused: 'Chrome could not bring its window to the front — another app is in front and the OS refused the focus change (macOS may), or the window is on another desktop / Space',
@@ -238,8 +264,11 @@ function fakeDownload(params) {
   if (fake.dl.mode === 'not_started') throw { code: 'DOWNLOAD_NOT_STARTED', message: 'the press started no download in Chrome' };
   if (fake.dl.mode === 'button_gone' && params.cmd === 'file_preview_download') throw { code: 'PREVIEW_NO_DOWNLOAD', message: 'the preview panel shows no download button' };
   if (params.cmd === 'file_click') fake.clickedFiles.push(params.args.name);
+  // A report export: Chrome names the file (the format chosen in the export menu, or a direct download).
+  const exported = params.cmd === 'model_menu_choose' ? `deep-research-report.${/pdf/i.test(params.args.label) ? 'pdf' : 'md'}` : fake.files[params.args?.index]?.kind === 'export' ? 'deep-research-report.pdf' : null;
+  if (params.cmd === 'model_menu_choose') fake.exportMenu = null;
   mkdirSync(FAKE_DOWNLOADS, { recursive: true });
-  const file = path.join(FAKE_DOWNLOADS, path.basename(params.name));
+  const file = path.join(FAKE_DOWNLOADS, exported ?? path.basename(params.name));
   writeFileSync(file, FILE_BODY(params.name));
   const id = ++fake.dl.ids;
   fake.dl.live.set(id, file);
@@ -267,7 +296,7 @@ function fakeSnapshot() {
   const sent = fake.clicks > 0;
   return {
     state: generating ? 'streaming' : 'done',
-    conversation_id: fake.newChat ? null : generating ? 'local-chatgpt:00000000-0000-4000-8000-000000000001' : fake.conv,
+    conversation_id: fake.newChat ? null : generating && !fake.convWhileGenerating ? 'local-chatgpt:00000000-0000-4000-8000-000000000001' : fake.conv,
     chars: generating ? 5 : fake.reply.length,
     uploading: false,
     generating,
@@ -282,13 +311,17 @@ function fakeSnapshot() {
     hash: generating ? `partial-${Date.now()}` : `final-${fake.reply.length}`,
     tab_hidden: !!fake.held || !!fake.hidden,
     composer_has_text: !!fake.held,
+    ...(!tools.legacy && { tool: shownTool(), research: fake.research }),
   };
 }
 
 function fakeHandle(method, params) {
   fake.received.push(method === 'page' ? `page:${params.cmd}` : method);
   fake.lastSite = params.site;
-  if (method === 'status') return { state: 'done', conversation_id: fake.newChat ? null : fake.conv, chars: 42, uploading: false, has_reply: true, last_role: 'assistant', mcp_tab_open: true };
+  if (method === 'status') {
+    const research = tools.legacy ? {} : { tool: shownTool(), research_active: !!fake.research.active, research_progress: !!fake.research.progress };
+    return { state: fake.research.active ? 'thinking' : 'done', conversation_id: fake.newChat ? null : fake.conv, chars: 42, uploading: false, has_reply: true, last_role: 'assistant', mcp_tab_open: true, ...research };
+  }
   if (method === 'open_conversation') {
     return { url: params.url, conversation_id: params.url.match(/\/(?:c|app)\/([\w-]+)/)?.[1] ?? null, tab_id: 7 };
   }
@@ -311,10 +344,11 @@ function fakeHandle(method, params) {
         throw { code: 'CONVERSATION_MISMATCH', message: `tab shows ${fake.newChat ? 'a new chat' : fake.conv}` };
       }
       if (fake.phase === 'generating') throw { code: 'STILL_GENERATING', message: 'still generating' };
-      if (!fake.latestTurn) return { conversation_id: fake.newChat ? null : fake.conv, baseline: BASELINE };
+      if (fake.research.active) throw { code: 'STILL_GENERATING', message: 'Deep Research still seems to be running' }; // like content.js
+      if (!fake.latestTurn) return { conversation_id: fake.newChat ? null : fake.conv, tool: shownTool(), baseline: BASELINE };
       fake.sentHash = fakeHash(args.text);
       fake.renderedHash = fakeHash(args.text.replace(/`/g, '')); // the bubble shows `code` without backticks
-      return { conversation_id: fake.newChat ? null : fake.conv, baseline: { ...BASELINE, assistant_count: 2, last_user_hash: fake.userHash, sent_hash: fake.sentHash } };
+      return { conversation_id: fake.newChat ? null : fake.conv, tool: shownTool(), baseline: { ...BASELINE, assistant_count: 2, last_user_hash: fake.userHash, sent_hash: fake.sentHash } };
     case 'clear_composer':
       return { cleared: true };
     case 'click_send':
@@ -335,7 +369,7 @@ function fakeHandle(method, params) {
     case 'snapshot':
       return fakeSnapshot();
     case 'extract_reply':
-      return { markdown: fake.reply, conversation_id: 'conv-test', message_id: 'a2' };
+      return { markdown: fake.reply, conversation_id: fake.conv, message_id: 'a2', ...fake.extract };
     case 'upload_begin':
       fake.uploads.set(args.upload_id, args.files.map((f) => ({ ...f, chunks: [] })));
       return fake.upload.legacy ? { ok: true } : { ok: true, methods: fake.upload.methods };
@@ -382,7 +416,7 @@ function fakeHandle(method, params) {
         const shown = fake.newChat && fake.gem.toggle;
         return { model: picker.model, mode: shown ? fake.gem.mode : null, modes: shown ? ['Chat', 'Task'].map((label) => ({ label, selected: label === fake.gem.mode })) : null };
       }
-      return { model: picker.model, mode: picker.mode, modes: ['Chat', 'Work'].map((label) => ({ label, selected: label === picker.mode })) };
+      return { model: picker.model, mode: picker.mode, modes: ['Chat', 'Work'].map((label) => ({ label, selected: label === picker.mode })), ...(!tools.legacy && { tool: shownTool() }) };
     case 'set_mode':
       if (params.site === 'gemini') {
         fake.gem.presses.push(args.label);
@@ -395,8 +429,13 @@ function fakeHandle(method, params) {
       picker.open = true;
       return { model: picker.model };
     case 'model_menu_read':
-      return { items: pickerItems() };
+      return { items: fake.exportMenu ? fake.exportMenu.map((label, index) => ({ index, label, description: null, selected: false, disabled: false, submenu: false })) : pickerItems() };
     case 'model_menu_choose': {
+      if (fake.exportMenu) {
+        if (fake.exportMenu[args.index] !== args.label) throw { code: 'MENU_CHANGED', message: 'menu changed' };
+        fake.exportMenu = null;
+        return { pressed: args.label };
+      }
       const item = pickerItems()[args.index];
       if (item?.label !== args.label) throw { code: 'MENU_CHANGED', message: 'menu changed' };
       picker.pressed.push(item.label);
@@ -411,13 +450,45 @@ function fakeHandle(method, params) {
       return {};
     case 'model_menu_close':
       Object.assign(picker, { open: false, sub: false });
+      fake.exportMenu = null;
       return { method: 'escape' };
+    case 'tool_state':
+      if (tools.legacy) throw { code: 'UNKNOWN_COMMAND', message: 'unknown page command: tool_state' };
+      return { tool: params.site === 'gemini' ? null : shownTool(), supported: params.site !== 'gemini' };
+    case 'tools_menu_open':
+      if (tools.legacy) throw { code: 'UNKNOWN_COMMAND', message: 'unknown page command: tools_menu_open' };
+      tools.open = true;
+      return { opened: true, tool: tools.active };
+    case 'tools_menu_read':
+      return { items: toolItems() };
+    case 'tools_menu_choose': {
+      const item = toolItems()[args.index];
+      if (item?.label !== args.label) throw { code: 'MENU_CHANGED', message: 'menu changed' };
+      tools.pressed.push(item.label);
+      if (/photo|file/i.test(item.label)) throw { code: 'NOT_A_TOOL', message: 'adds files' };
+      if (item.submenu) tools.sub = true;
+      else {
+        if (tools.sticks) tools.active = tools.active === item.label ? null : item.label;
+        Object.assign(tools, { open: false, sub: false });
+      }
+      return { pressed: item.label };
+    }
+    case 'tools_menu_close':
+      Object.assign(tools, { open: false, sub: false });
+      return { method: 'escape' };
+    case 'tool_clear':
+      if (!tools.active) return { pressed: null, tool: null };
+      if (!tools.clearWorks) return { pressed: null, tool: tools.active, reason: `no remove control found on the "${tools.active}" pill` };
+      tools.pressed.push(`remove ${tools.active}`);
+      tools.active = null;
+      return { pressed: 'button [aria-label="Remove"]', tool: null };
     case 'files_list':
       if (fake.filesLegacy) throw { code: 'UNKNOWN_COMMAND', message: 'unknown page command: files_list' };
       if (params.site === 'gemini') return { supported: false, conversation_id: fake.newChat ? null : fake.conv, files: [] };
       return { supported: true, conversation_id: fake.newChat ? null : fake.conv, message: args.message, replies: 1, current: true, generating: false, files: fake.files };
     case 'file_click':
       fake.clickedFiles.push(args.name);
+      if (fake.files[args.index]?.kind === 'export' && fake.files[args.index].menu) fake.exportMenu = ['Copy contents', 'Export to Markdown', 'Export to PDF'];
       return { clicked: true, kind: fake.files[args.index]?.kind, name: args.name };
     case 'file_preview_state':
       return { open: true, download: fake.dl.previewButton, panel: 'aside [role="dialog"]', control: fake.dl.previewButton ? 'button [aria-label="Download"]' : null };
@@ -1797,6 +1868,264 @@ try {
   r = await call('get_latest_reply', { site: 'chatgpt', wait_seconds: 20 });
   check('…a send never recognised by its fingerprint is not checked against it: the reply is read', !r.isError && r.text === 'Reply to a long prompt.\n', JSON.stringify(r.data));
   Object.assign(fake, { latestTurn: false, userHash: null, fingerprint: false, generateOnClick: true, reply: REPLY, conv: 'conv-test', phase: 'done' });
+
+  // 11. ChatGPT composer tools / Deep Research (live 2026-11-22: not in the model menu, not a mode — expected as a "+" menu tool).
+  await call('open_conversation', { url_or_id: 'https://chatgpt.com/' });
+  Object.assign(tools, { active: null, open: false, sub: false, pressed: [], sticks: true, clearWorks: true, legacy: false, pill: true, menuSelected: true });
+  r = await call('select_model', { site: 'chatgpt' });
+  check(
+    'select_model without arguments also lists the composer "+" menu, its "More" submenu included, pressing no tool and closing it',
+    !r.isError && r.data.tool === null && r.data.tools?.map((t) => t.label).join() === 'Add photos & files,Deep research,Create image,More,Web search,Canvas' &&
+      r.data.tools.find((t) => t.label === 'Canvas').in === 'More' && r.data.tools.find((t) => t.label === 'Deep research').in === null &&
+      r.data.models.length > 0 && tools.pressed.join() === 'More' && !tools.open && tools.active === null,
+    JSON.stringify(r.data),
+  );
+  tools.pressed = [];
+  mark = fake.received.length;
+  r = await call('select_model', { site: 'chatgpt', tool: 'deep research' });
+  check(
+    'select_model { tool: "deep research" } presses it in the "+" menu, confirms it on the page, leaves the model picker alone',
+    !r.isError && r.data.tool === 'Deep research' && tools.active === 'Deep research' && tools.pressed.join() === 'Deep research' && r.data.models === null &&
+      !since(mark).includes('page:model_menu_open') && !tools.open,
+    JSON.stringify(r.data),
+  );
+  r = await call('get_status', { site: 'chatgpt' });
+  check('get_status shows the active tool (research_active: false before sending)', !r.isError && r.data.tool === 'Deep research' && r.data.research_active === false, JSON.stringify(r.data));
+  r = await call('select_model', { site: 'chatgpt', tool: 'Deep research' });
+  check('…choosing the tool that is already on presses nothing', !r.isError && r.data.tool === 'Deep research' && tools.pressed.length === 1, JSON.stringify(r.data));
+  tools.pressed = [];
+  r = await call('select_model', { site: 'chatgpt', tool: 'Add photos' });
+  check(
+    'an item that adds files is never a tool: TOOL_NOT_FOUND, only the submenu opened, nothing else pressed',
+    r.isError && r.data.error.code === 'TOOL_NOT_FOUND' && /never pressed/.test(r.data.error.message) && tools.pressed.join() === 'More' && !tools.open && tools.active === 'Deep research',
+    JSON.stringify(r.data),
+  );
+  tools.pressed = [];
+  r = await call('select_model', { site: 'chatgpt', tool: 'canvas' });
+  check('a tool inside the "More" submenu is found there', !r.isError && r.data.tool === 'Canvas' && tools.pressed.join() === 'More,Canvas' && !tools.open, JSON.stringify(r.data));
+  r = await call('select_model', { site: 'chatgpt', tool: 'Deep research' });
+  tools.sticks = false;
+  r = await call('select_model', { site: 'chatgpt', tool: 'Create image' });
+  check(
+    'a press the composer does not show → TOOL_NOT_CONFIRMED (look at the tab before sending)',
+    r.isError && r.data.error.code === 'TOOL_NOT_CONFIRMED' && r.data.error.pressed === 'Create image' && r.data.error.tool === 'Deep research' && /show_tab/.test(r.data.error.message),
+    JSON.stringify(r.data),
+  );
+  tools.sticks = true;
+  r = await call('select_model', { site: 'chatgpt', tool: 'none' });
+  check('select_model { tool: "none" } turns the tool off via its pill', !r.isError && r.data.tool === null && tools.active === null && tools.pressed.at(-1) === 'remove Deep research', JSON.stringify(r.data));
+  Object.assign(tools, { active: 'Deep research', clearWorks: false, pressed: [] });
+  r = await call('select_model', { site: 'chatgpt', tool: 'off' });
+  check('…without a usable remove control: its "+" menu entry (shown selected) is pressed again', !r.isError && r.data.tool === null && tools.pressed[0] === 'Deep research' && tools.active === null, JSON.stringify(r.data));
+  Object.assign(tools, { active: 'Deep research', sticks: false });
+  r = await call('select_model', { site: 'chatgpt', tool: 'none' });
+  check('…and when nothing turns it off → TOOL_NOT_CLEARED', r.isError && r.data.error.code === 'TOOL_NOT_CLEARED' && r.data.error.tool === 'Deep research', JSON.stringify(r.data));
+  Object.assign(tools, { active: null, sticks: true, clearWorks: true, legacy: true, pressed: [] });
+  r = await call('select_model', { site: 'chatgpt' });
+  check('content.js from before composer tools: a plain select_model still lists models (tools: null + a reload warning)', !r.isError && r.data.models.length > 0 && r.data.tools === null && r.data.tool === null && /reload/.test(r.data.warning), JSON.stringify(r.data));
+  r = await call('select_model', { site: 'chatgpt', tool: 'Deep research' });
+  check('…select_model { tool } → EXTENSION_OUTDATED', r.isError && r.data.error.code === 'EXTENSION_OUTDATED', JSON.stringify(r.data));
+  r = await call('get_status', { site: 'chatgpt' });
+  check('…get_status → tool: null, research_active: false', !r.isError && r.data.tool === null && r.data.research_active === false, JSON.stringify(r.data));
+  tools.legacy = false;
+  r = await call('select_model', { site: 'gemini', tool: 'Deep Research' });
+  check('Gemini tools are not wired up → NOT_SUPPORTED', r.isError && r.data.error.code === 'NOT_SUPPORTED', JSON.stringify(r.data));
+
+  // Opt-in only: a send without `tool` asserts that no tool is on (a leftover Deep research must not spend its quota).
+  await call('open_conversation', { url_or_id: 'https://chatgpt.com/c/conv-test' });
+  Object.assign(tools, { active: 'Deep research', pressed: [] }); // left on by hand
+  mark = fake.received.length;
+  const gateClicks = fake.clicks;
+  r = await call('send_message', { site: 'chatgpt', text: 'a normal question' });
+  check(
+    'a default send with a tool on in the composer → TOOL_MISMATCH, nothing typed or clicked',
+    r.isError && r.data.error.code === 'TOOL_MISMATCH' && r.data.error.tool === 'Deep research' && /tool: "Deep research"/.test(r.data.error.message) && !since(mark).includes('page:fill_composer') && fake.clicks === gateClicks,
+    JSON.stringify(r.data),
+  );
+  r = await call('select_model', { site: 'chatgpt', tool: 'none' });
+  check('…select_model { tool: "none" } clears it', !r.isError && r.data.tool === null && tools.active === null, JSON.stringify(r.data));
+  // The composer pill is not recognised (UNVERIFIED selectors) but the "+" menu shows the tool selected.
+  Object.assign(tools, { pill: false, pressed: [] });
+  r = await call('select_model', { site: 'chatgpt', tool: 'Deep research' });
+  check('without a recognised pill the "+" menu\'s selected state confirms the tool', !r.isError && r.data.tool === 'Deep research' && r.data.tool_confirmed_by === 'menu' && tools.active === 'Deep research', JSON.stringify(r.data));
+  r = await call('get_status', { site: 'chatgpt' });
+  check('…get_status reports the menu-confirmed tool too', !r.isError && r.data.tool === 'Deep research', JSON.stringify(r.data));
+  mark = fake.received.length;
+  r = await call('send_message', { site: 'chatgpt', text: 'a normal question' });
+  check(
+    '…a default send is refused by what this server turned on, though the page shows no pill (TOOL_MISMATCH, nothing typed)',
+    r.isError && r.data.error.code === 'TOOL_MISMATCH' && /turned on through this server/.test(r.data.error.message) && !since(mark).includes('page:fill_composer'),
+    JSON.stringify(r.data),
+  );
+  r = await call('select_model', { site: 'chatgpt', tool: 'none' });
+  check('…tool "none" turns it off through the menu', !r.isError && r.data.tool === null && tools.active === null, JSON.stringify(r.data));
+  // Neither pill nor menu state: the press stays unconfirmed, sends refuse until tool "none" (with a warning).
+  Object.assign(tools, { menuSelected: false, pressed: [] });
+  r = await call('select_model', { site: 'chatgpt', tool: 'Canvas' });
+  check('a press neither the composer nor the menu shows → TOOL_NOT_CONFIRMED', r.isError && r.data.error.code === 'TOOL_NOT_CONFIRMED' && r.data.error.pressed === 'Canvas', JSON.stringify(r.data));
+  r = await call('send_message', { site: 'chatgpt', text: 'a normal question' });
+  check('…then a default send → TOOL_MISMATCH (never confirmed)', r.isError && r.data.error.code === 'TOOL_MISMATCH' && /never confirmed/.test(r.data.error.message), JSON.stringify(r.data));
+  r = await call('select_model', { site: 'chatgpt', tool: 'none' });
+  check('…tool "none" with nothing on the page to tell: taken as off, with a warning to check the tab', !r.isError && r.data.tool === null && /remove it by hand/.test(r.data.warning), JSON.stringify(r.data));
+  Object.assign(tools, { active: null, pill: true, menuSelected: true, pressed: [] });
+  // send_message { tool } turns the tool on itself (and confirms it) before typing; a failure types nothing.
+  tools.sticks = false;
+  mark = fake.received.length;
+  r = await call('send_message', { site: 'chatgpt', text: 'research this', tool: 'Deep research' });
+  check('send_message { tool } that cannot be confirmed → TOOL_NOT_CONFIRMED, nothing typed', r.isError && r.data.error.code === 'TOOL_NOT_CONFIRMED' && !since(mark).includes('page:fill_composer'), JSON.stringify(r.data));
+  tools.sticks = true;
+  r = await call('select_model', { site: 'chatgpt', tool: 'none' });
+  Object.assign(tools, { active: null, pressed: [] });
+
+  // A Deep Research send: the research runs without a stop button (UNVERIFIED UI) — still_running, then the report.
+  const REPORT = '# Report\n\nFindings with a [source](https://example.org/a).\n';
+  tools.pill = false; // confirmed by the menu only, as long as the pill selectors are unverified
+  Object.assign(fake, { conv: 'conv-test', latestTurn: true, fingerprint: true, userHash: fakeHash('earlier'), generateOnClick: false, nextReply: '', phase: 'done' });
+  r = await call('send_message', { site: 'chatgpt', text: 'Research the topic', tool: 'Deep research' });
+  check('send_message { tool: "Deep research" } turns it on, then sends and reports the tool', !r.isError && r.data.confirmed && r.data.tool === 'Deep research' && tools.active === 'Deep research' && tools.pressed.includes('Deep research'), JSON.stringify(r.data));
+  fake.research = { active: true, progress: true, completed: false, frame: false, label: 'Researching…', hash: 'r1' };
+  r = await call('get_latest_reply', { site: 'chatgpt', wait_seconds: 5 });
+  check('while the research runs (no stop button): still_running with researching: true', !r.isError && r.data.state === 'still_running' && r.data.researching === true, JSON.stringify(r.data));
+  const drJob = r.data.job_id;
+  r = await call('get_status', { site: 'chatgpt' });
+  check('…get_status: research_active, state "thinking"', !r.isError && r.data.research_active === true && r.data.state === 'thinking', JSON.stringify(r.data));
+  const clicksDuringResearch = fake.clicks;
+  r = await call('send_message', { site: 'chatgpt', text: 'are you done?', tool: 'Deep research' });
+  check('…a send is refused meanwhile (it could interrupt the research)', r.isError && r.data.error.code === 'STILL_GENERATING' && fake.clicks === clicksDuringResearch, JSON.stringify(r.data));
+  const drWaiter = runWaiter([drJob]);
+  await sleep(4_000);
+  r = await call('get_job', { job_id: drJob, wait_seconds: 1 });
+  check('…still running after a while (a research reply is never "done" by a quiet page alone)', !r.isError && r.data.state === 'still_running', JSON.stringify(r.data));
+  const drTarget = path.join(TMP, 'dr', 'report.md');
+  r = await call('get_latest_reply', { site: 'chatgpt', save_to: drTarget, wait_seconds: 1 });
+  Object.assign(fake, { reply: REPORT, research: { active: false, progress: false, completed: true, frame: false, label: 'Research completed in 14m', hash: 'r2' } });
+  r = await call('get_job', { job_id: drJob, wait_seconds: 20 });
+  check('the finished report is saved to save_to with its links', !r.isError && r.data.complete && readFileSync(r.data.saved_to, 'utf8') === REPORT && !r.data.warning, JSON.stringify(r.data));
+  w = await drWaiter;
+  check('…wait-job.mjs exits 0', w.code === 0 && w.out?.status === 'done', JSON.stringify(w));
+
+  // Only a progress indicator, no report text: waited out (RESEARCH_QUIET_MS), then read as it is with a warning.
+  Object.assign(fake, { userHash: fakeHash('Research the topic'), nextReply: '', extract: { source: 'text', frames_unreadable: 1 } });
+  fake.research = { active: false, progress: true, completed: false, frame: true, label: null, hash: 'p1' };
+  r = await call('send_message', { site: 'chatgpt', text: 'Research another topic', tool: 'Deep research' });
+  const started = Date.now();
+  r = await call('get_latest_reply', { site: 'chatgpt', wait_seconds: 2 });
+  check('a progress indicator after a research send keeps the job running', !r.isError && r.data.state === 'still_running' && r.data.researching === true, JSON.stringify(r.data));
+  r = await call('get_status', { site: 'chatgpt' });
+  check('…and get_status counts it as research (the send went out with Deep research)', !r.isError && r.data.research_active === true, JSON.stringify(r.data));
+  fake.research = { ...fake.research, progress: false, hash: 'p2' };
+  r = await call('get_latest_reply', { site: 'chatgpt', wait_seconds: 20 });
+  check(
+    '…a research reply without report text is read only after RESEARCH_QUIET_MS, with warnings pointing at list_files',
+    !r.isError && r.data.complete && Date.now() - started >= RESEARCH_QUIET_MS && /no report text/.test(r.data.warning) && /list_files/.test(r.data.warning),
+    JSON.stringify(r.data),
+  );
+
+  // A clarifying question is an ordinary reply: it completes at once, without the research wait or a warning.
+  Object.assign(fake, { userHash: fakeHash('Research another topic'), nextReply: 'Before I start: which years should I cover?\n', extract: {}, research: NO_RESEARCH });
+  r = await call('send_message', { site: 'chatgpt', text: 'Research a third topic', tool: 'Deep research' });
+  r = await call('get_latest_reply', { site: 'chatgpt', wait_seconds: 20 });
+  check('a clarifying question from Deep Research completes like a normal reply', !r.isError && r.data.complete && r.text === 'Before I start: which years should I cover?\n' && !r.data.warning, JSON.stringify(r.data));
+
+  // A research job whose tab is moved: exit 4, and after the reopen the job still knows it waits for the research
+  // (a bare progress indicator keeps it running although the reopen forgot the send).
+  Object.assign(fake, { userHash: fakeHash('Research a third topic'), nextReply: '' });
+  r = await call('send_message', { site: 'chatgpt', text: 'Research a fourth topic', tool: 'Deep research' });
+  fake.research = { active: false, progress: true, completed: false, frame: false, label: null, hash: 'm1' };
+  r = await call('get_latest_reply', { site: 'chatgpt', wait_seconds: 2 });
+  const movedResearch = runWaiter([r.data.job_id]);
+  fake.conv = 'conv-other';
+  w = await movedResearch;
+  check('a research job on a moved tab → wait-job exits 4 (tab_moved)', w.code === 4 && w.out?.conversation_id === 'conv-test', JSON.stringify(w));
+  fake.conv = 'conv-test';
+  await call('open_conversation', { url_or_id: 'conv-test', site: 'chatgpt' });
+  r = await call('get_latest_reply', { site: 'chatgpt', wait_seconds: RESEARCH_QUIET_MS / 1000 + 3 });
+  check('…after open_conversation the new job still waits for the research (researching: true, no premature "done")', !r.isError && r.data.state === 'still_running' && r.data.researching === true, JSON.stringify(r.data));
+  Object.assign(fake, { reply: REPORT, research: { active: false, progress: false, completed: true, frame: false, label: 'Research completed in 31m', hash: 'm2' } });
+  r = await call('get_job', { job_id: r.data.job_id, wait_seconds: 20 });
+  check('…and reads the report once it is done', !r.isError && r.data.complete && r.text === REPORT, JSON.stringify(r.data));
+  // The same from a new chat (the documented flow): the research send's conversation id is learned after the send.
+  Object.assign(fake, { research: NO_RESEARCH, reply: REPLY, userHash: fakeHash('Research a fourth topic'), nextReply: '' });
+  await call('open_conversation', { url_or_id: 'https://chatgpt.com/' });
+  Object.assign(fake, { newChat: true, latestTurn: false });
+  r = await call('send_message', { site: 'chatgpt', text: 'Research from a new chat', tool: 'Deep research', expect_conversation_id: 'new' });
+  check('a research send from a new chat goes out with the tool', !r.isError && r.data.tool === 'Deep research', JSON.stringify(r.data));
+  // The research card shows no stop button and no report text yet; the new chat gets its id.
+  Object.assign(fake, { newChat: false, conv: 'conv-dr-new', phase: 'done', reply: '', research: { active: false, progress: true, completed: false, frame: false, label: null, hash: 'n1' } });
+  r = await call('get_latest_reply', { site: 'chatgpt', wait_seconds: 2 });
+  const movedNew = runWaiter([r.data.job_id]);
+  fake.conv = 'conv-other';
+  w = await movedNew;
+  check('…its job on a moved tab → exit 4 naming the conversation the new chat became', w.code === 4 && w.out?.conversation_id === 'conv-dr-new', JSON.stringify(w));
+  fake.conv = 'conv-dr-new';
+  await call('open_conversation', { url_or_id: 'conv-dr-new', site: 'chatgpt' });
+  r = await call('get_latest_reply', { site: 'chatgpt', wait_seconds: RESEARCH_QUIET_MS / 1000 + 3 });
+  check('…after the reopen it still waits for the research (researching: true)', !r.isError && r.data.state === 'still_running' && r.data.researching === true, JSON.stringify(r.data));
+  Object.assign(fake, { reply: REPORT, research: { active: false, progress: false, completed: true, frame: false, label: 'Research completed in 12m', hash: 'n2' } });
+  r = await call('get_job', { job_id: r.data.job_id, wait_seconds: 20 });
+  check('…and reads the report once it is done', !r.isError && r.data.complete && r.text === REPORT, JSON.stringify(r.data));
+  Object.assign(fake, { conv: 'conv-test', phase: 'done' });
+
+  // A report's export control (UNVERIFIED): list_files offers it, download_file picks the format in its menu.
+  fake.files = [...REPLY_FILES, { index: REPLY_FILES.length, name: 'Export', kind: 'export', label: 'Export', menu: true }];
+  r = await call('list_files', { site: 'chatgpt' });
+  check('list_files offers a report export as kind "export"', !r.isError && r.data.files.at(-1).kind === 'export' && r.data.files.at(-1).menu === true, JSON.stringify(r.data));
+  const exportDir = path.join(TMP, 'exports');
+  const discardedBefore = fake.dl.discarded.length;
+  r = await call('download_file', { site: 'chatgpt', name: 'Export', save_to: `${exportDir}/` });
+  check(
+    'download_file on an export: Markdown chosen by default, saved under the downloaded name, Chrome\'s copy removed',
+    !r.isError && r.data.via === 'export' && r.data.format === 'Export to Markdown' && r.data.path === path.join(exportDir, 'deep-research-report.md') && existsSync(r.data.path) &&
+      fake.dl.discarded.length === discardedBefore + 1 && fake.exportMenu === null,
+    JSON.stringify(r.data),
+  );
+  r = await call('download_file', { site: 'chatgpt', name: 'Export', save_to: exportDir, format: 'pdf' });
+  check('…format "pdf" picks the PDF entry', !r.isError && r.data.format === 'Export to PDF' && r.data.path.endsWith('deep-research-report.pdf'), JSON.stringify(r.data));
+  const discardedBeforeTaken = fake.dl.discarded.length;
+  r = await call('download_file', { site: 'chatgpt', name: 'Export', save_to: exportDir });
+  check('…a taken name → FILE_EXISTS, and Chrome\'s copy is still removed', r.isError && r.data.error.code === 'FILE_EXISTS' && fake.dl.discarded.length === discardedBeforeTaken + 1, JSON.stringify(r.data));
+  r = await call('download_file', { site: 'chatgpt', name: 'Export', save_to: exportDir, format: 'docx' });
+  check('…a format the menu lacks → FORMAT_NOT_FOUND listing the offered ones', r.isError && r.data.error.code === 'FORMAT_NOT_FOUND' && /Export to PDF/.test(r.data.error.message) && fake.exportMenu === null, JSON.stringify(r.data));
+  resetFiles();
+  Object.assign(tools, { pill: true, menuSelected: true });
+  r = await call('select_model', { site: 'chatgpt', tool: 'none' });
+  check('select_model { tool: "none" } leaves the tab with no tool (the opt-in end state)', !r.isError && r.data.tool === null && tools.active === null, JSON.stringify(r.data));
+  Object.assign(fake, { latestTurn: false, userHash: null, fingerprint: false, generateOnClick: true, reply: REPLY, conv: 'conv-test', phase: 'done', research: NO_RESEARCH, extract: {} });
+
+  // 12. The tab moved to another conversation mid-reply (2026-11-22): the reply is fine, so the job says how to recover.
+  await call('open_conversation', { url_or_id: 'https://chatgpt.com/c/conv-test' });
+  fake.convWhileGenerating = true;
+  r = await call('send_message', { site: 'chatgpt', text: 'a long question' });
+  const clicksAfterSend = fake.clicks;
+  r = await call('get_latest_reply', { site: 'chatgpt', wait_seconds: 3 });
+  const movedJob = r.data.job_id;
+  const movedWaiter = runWaiter([movedJob]);
+  fake.conv = 'conv-other'; // switched by hand
+  w = await movedWaiter;
+  check(
+    'wait-job.mjs exits 4 with status "tab_moved", the conversation to reopen and a never-resend recovery',
+    w.code === 4 && w.out?.status === 'tab_moved' && w.out.conversation_id === 'conv-test' && w.out.error?.code === 'CONVERSATION_CHANGED' && w.out.error.tab_moved === true &&
+      /open_conversation \{ url_or_id: "conv-test", site: "chatgpt" \}/.test(w.out.error.recovery) && /get_latest_reply/.test(w.out.error.recovery) && /Do NOT send/.test(w.out.error.recovery),
+    JSON.stringify(w),
+  );
+  r = await call('get_job', { job_id: movedJob, wait_seconds: 1 });
+  check('…get_job carries tab_moved, conversation_id and recovery too', r.isError && r.data.error.tab_moved === true && r.data.error.conversation_id === 'conv-test' && /Do NOT send/.test(r.data.error.message), JSON.stringify(r.data));
+  Object.assign(fake, { conv: 'conv-test', phase: 'done' });
+  await call('open_conversation', { url_or_id: 'conv-test', site: 'chatgpt' });
+  r = await call('get_latest_reply', { site: 'chatgpt', wait_seconds: 20 });
+  check('…the documented recovery (open_conversation + get_latest_reply) reads the reply without a resend', !r.isError && r.data.complete && r.text === REPLY && fake.clicks === clicksAfterSend, JSON.stringify(r.data));
+
+  // Seen moved by get_status first and back on the URL by the next poll: PAGE_STALE inside the job, same exit 4.
+  r = await call('send_message', { site: 'chatgpt', text: 'another long question' });
+  r = await call('get_latest_reply', { site: 'chatgpt', wait_seconds: 3 });
+  const staleWaiter = runWaiter([r.data.job_id]);
+  fake.conv = 'conv-other';
+  await call('get_status', { site: 'chatgpt' });
+  fake.conv = 'conv-test';
+  w = await staleWaiter;
+  check('…a stale page inside a reply job also exits 4 (tab_moved)', w.code === 4 && w.out?.status === 'tab_moved' && w.out.conversation_id === 'conv-test' && /Do NOT send/.test(w.out.error?.recovery ?? ''), JSON.stringify(w));
+  await call('open_conversation', { url_or_id: 'https://chatgpt.com/c/conv-test' });
+  Object.assign(fake, { phase: 'done', convWhileGenerating: false });
 
   r = await call('inspect_page', { selector: 'main', depth: 3 });
   check('inspect_page returns metadata plus a DOM outline', !r.isError && r.data.matched === 1 && /data-testid/.test(r.text || ''), JSON.stringify(r));

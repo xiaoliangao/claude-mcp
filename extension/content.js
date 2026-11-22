@@ -110,6 +110,39 @@
       ],
       previewPanel: ['[role="dialog"]', 'aside', '[data-testid*="preview"]', '[class*="preview" i]', '[data-state="open"]', 'section'],
       previewClose: ['button[aria-label="Close"]', 'button[aria-label^="Close "]', 'button[aria-label*="关闭"]', '[data-testid*="close"]'],
+      // Composer tools ("Deep research", "Create image", … — not in the model menu, live 2026-11-22). toolsButton is
+      // the "+" left of the prompt (live 2026-11-22: button[aria-label="Add files and more"], a Radix menu trigger
+      // with aria-expanded / data-state); its menu is read like the model menu, "More" opening a submenu.
+      // UNVERIFIED: the menu's contents (Deep research is expected there, not yet seen) and, never seen with a tool
+      // on, how the chosen tool shows in the composer. toolPill / toolRemove are
+      // guesses; toolNames backs them up: a control in the composer (outside the prompt) whose label starts with a
+      // known tool name — every tool name read from the "+" menu on this page counts too.
+      toolsButton: ['form button[aria-label="Add files and more"]', 'button[data-testid="composer-plus-btn"]', 'form button[aria-label="添加文件等"]'],
+      toolPill: [
+        '[data-testid*="composer-pill" i]',
+        '[data-testid*="system-hint" i]',
+        '[class*="composer-pill" i]',
+        '[class*="ComposerPill"]',
+        '[class*="SystemHint"]',
+        '[class*="ToolPill"]',
+        'button[aria-label*="click to remove" i]',
+      ],
+      toolRemove: ['button[aria-label*="remove" i]', 'button[aria-label*="clear" i]', 'button[aria-label^="Close" i]', 'button[aria-label*="移除"]', 'button[aria-label*="删除"]', 'button[aria-label*="取消"]'],
+      toolNames: ['Deep research', 'Agent mode', 'Create image', 'Web search', 'Canvas', 'Study and learn', 'Shopping research', '深度研究', '代理模式', '创建图片', '网页搜索', '画布'],
+      // Deep Research in progress / finished, looked for in the current reply only — all UNVERIFIED (its running
+      // and report DOM was never observed). researchBusy / researchBusyText are research-specific (strong);
+      // researchProgress only counts while the last send went out with a research tool (a progress bar alone is
+      // not proof). The server also waits out a research reply that has no Markdown yet.
+      researchBusy: ['button[aria-label*="stop research" i]', 'button[aria-label*="cancel research" i]', 'button[aria-label*="停止研究"]', '[data-testid*="research-progress" i]'],
+      // Research-specific phrases only: a lingering "Searching the web" row of an ordinary reply must not hold a job
+      // (or block sends) for hours.
+      researchBusyText: /^(starting (deep )?research|researching\b|deep research (is )?(in progress|running)|compiling (the )?(research )?report|writing (the )?(research )?report|正在研究|研究中|正在进行深度研究)/i,
+      researchProgress: ['[role="progressbar"]', '[aria-busy="true"]'],
+      researchDoneText: /^(research completed|completed research|research finished|deep research completed|研究完成|已完成研究)/i,
+      // An export / download control of a report (UNVERIFIED), offered by list_files as kind "export". One that opens
+      // a menu (aria-haspopup / aria-expanded) gets its format picked there by download_file.
+      exportControl: ['button', '[role="button"]', 'a[href]'],
+      exportLabel: /^(export|download)(\s+(report|research|as|to)\b.*)?$|^(导出|下载报告)/i,
     },
     // Verified 2026-11: composer, send/stop, messages, reply extraction, model menu, Chat / Task toggle.
     gemini: {
@@ -165,11 +198,23 @@
       previewDownload: [],
       previewPanel: [],
       previewClose: [],
+      // Gemini's "Tools" (Deep Research, Canvas, …) are not wired up: select_model { tool } → NOT_SUPPORTED.
+      toolsButton: [],
+      toolPill: [],
+      toolRemove: [],
+      toolNames: [],
+      researchBusy: [],
+      researchBusyText: null,
+      researchProgress: [],
+      researchDoneText: null,
+      exportControl: [],
+      exportLabel: null,
     },
   };
   const SELECTORS = SITE_SELECTORS[SITE];
 
-  const state = { uploads: new Map(), pendingText: null, menuBaseline: null, menuItems: [], preview: null };
+  // toolLabels: tool names read from the composer's "+" menu on this page (they back up activeTool).
+  const state = { uploads: new Map(), pendingText: null, menuBaseline: null, menuItems: [], preview: null, toolLabels: new Set() };
 
   // ---------------------------------------------------------------- DOM helpers
 
@@ -360,9 +405,11 @@
     const info = threadInfo();
     const isGenerating = generating();
     const text = replyText(info.replyParts);
-    const error = isGenerating ? null : errorText(info);
+    // Deep Research shows its own progress UI (UNVERIFIED); a strong sign of it counts as still working.
+    const research = researchState(info.replyParts);
+    const error = isGenerating || research.active ? null : errorText(info);
     let pageState;
-    if (isGenerating) pageState = text.length > 0 ? 'streaming' : 'thinking';
+    if (isGenerating || research.active) pageState = text.length > 0 ? 'streaming' : 'thinking';
     else if (error) pageState = 'error';
     else if (info.last_role === 'assistant') pageState = 'done';
     else pageState = 'idle';
@@ -385,6 +432,10 @@
       // attachment previews while hidden: the text stays in the composer.
       tab_hidden: document.visibilityState !== 'visible',
       composer_has_text: !!squash(readComposer(composer() || document.createElement('div'))),
+      // The composer tool that is on ("Deep research" …), else null; and the research state of the current reply:
+      // { active, progress, completed, frame, label, hash } (see researchState).
+      tool: activeTool()?.label ?? null,
+      research,
     };
   }
 
@@ -401,6 +452,9 @@
       // An assistant reply follows the latest user message on the page (readable with get_latest_reply).
       has_reply: s.has_reply,
       last_role: s.last_role,
+      tool: s.tool,
+      research_active: s.research.active,
+      research_progress: s.research.progress,
     };
   }
 
@@ -489,6 +543,9 @@
       throw fail('CONVERSATION_MISMATCH', `MCP tab shows ${shows}, expected ${expected === NEW_CHAT ? 'an empty new chat' : expected}; nothing was typed`);
     }
     if (generating()) throw fail('STILL_GENERATING', 'ChatGPT is still generating a reply; nothing was typed');
+    // A message sent into a running Deep Research could interrupt it (and its scarce quota).
+    const research = researchState(info.replyParts);
+    if (research.active) throw fail('STILL_GENERATING', `Deep Research still seems to be running (${research.label}); nothing was typed — wait for get_latest_reply / wait_command`);
     if (uploading()) throw fail('UPLOAD_IN_PROGRESS', 'a file upload is still in progress; nothing was typed');
     const box = composer();
     if (!box) throw fail('COMPOSER_NOT_FOUND', 'composer not found — update SELECTORS.composer (use inspect_page)');
@@ -508,6 +565,8 @@
     state.pendingText = want;
     return {
       conversation_id: current,
+      tool: activeTool()?.label ?? null, // the composer tool the message goes out with
+
       baseline: {
         user_count: info.user_count,
         assistant_count: info.assistant_count,
@@ -632,7 +691,7 @@
     const btn = firstVisible(SELECTORS.modelButton);
     const g = modeButtons();
     const modes = g ? g.buttons.map((b) => ({ label: labelOf(b), selected: isSelected(b, g.group) })) : null;
-    return { model: btn ? labelOf(btn) : null, modes, mode: modes?.find((m) => m.selected)?.label ?? null };
+    return { model: btn ? labelOf(btn) : null, modes, mode: modes?.find((m) => m.selected)?.label ?? null, tool: activeTool()?.label ?? null };
   }
 
   function setMode({ index, label }) {
@@ -676,7 +735,8 @@
     return {};
   }
 
-  function closeModelMenu({ force = false }) {
+  // which: "tools" when the composer's "+" menu is the one open (its button toggles it shut).
+  function closeModelMenu({ force = false, which = 'model' }) {
     if (!force) {
       const target = document.activeElement || document.body;
       for (const type of ['keydown', 'keyup']) {
@@ -685,10 +745,141 @@
       return { method: 'escape' };
     }
     const backdrop = firstVisible('.cdk-overlay-backdrop');
-    const btn = firstVisible(SELECTORS.modelButton);
+    const btn = firstVisible(which === 'tools' ? SELECTORS.toolsButton : SELECTORS.modelButton);
     if (backdrop) press(backdrop);
     else if (btn && btn.getAttribute('aria-expanded') !== 'false') press(btn);
     return { method: backdrop ? 'backdrop' : 'toggle' };
+  }
+
+  // ---------------------------------------------------------------- composer tools (ChatGPT "+" menu)
+  //
+  // tools_menu_open presses the "+" button; tools_menu_read / tools_menu_choose then work like the model menu's (the
+  // server walks submenus such as "More" and matches labels). Items that add files or photos are never pressed: they
+  // open the OS file dialog. activeTool reads which tool is on from the composer (UNVERIFIED, see toolPill).
+
+  const NOT_A_TOOL = /photo|file|upload|image from|camera|照片|文件|上传|相机/i;
+  const toolKey = (s) => String(s ?? '').normalize('NFKC').toLowerCase().replace(/\s+/g, ' ').trim();
+  // "Deep research, click to remove" / "Remove Deep research" / "Deep research ×" → "Deep research"
+  const toolNameOf = (s) =>
+    String(s ?? '')
+      .replace(/[,，]?\s*(click to remove|点击移除)\s*$/i, '')
+      .replace(/^(remove|clear|移除|删除)\s*/i, '')
+      .replace(/\s*[×✕✖]\s*$/, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+  function openToolsMenu() {
+    if (!SELECTORS.toolsButton.length) throw fail('NOT_SUPPORTED', `composer tools are not supported on ${SITE} yet`);
+    const btn = firstVisible(SELECTORS.toolsButton);
+    if (!btn) throw fail('TOOLS_BUTTON_NOT_FOUND', 'the composer "+" button was not found — fix SELECTORS.toolsButton (inspect_page selector "form")');
+    if (isDisabled(btn)) throw fail('TOOLS_UNAVAILABLE', 'the composer "+" button is disabled');
+    const expanded = btn.getAttribute('aria-expanded') === 'true';
+    state.menuBaseline = expanded ? new Set() : new Set(menuItems(null));
+    if (!expanded) press(btn);
+    return { opened: true, button: btn.getAttribute('aria-label') || labelOf(btn), tool: activeTool()?.label ?? null };
+  }
+
+  function readToolsMenu() {
+    const out = readModelMenu();
+    for (const i of out.items) if (i.label && !i.submenu && i.kind !== 'slider' && !NOT_A_TOOL.test(i.label)) state.toolLabels.add(toolNameOf(i.label));
+    return out;
+  }
+
+  function chooseTool(args) {
+    if (NOT_A_TOOL.test(args.label || '')) throw fail('NOT_A_TOOL', `"${args.label}" adds files — it is never pressed`);
+    return chooseModelItem(args);
+  }
+
+  // { label, el } of the tool that is on, else null. A toggle button counts only while pressed; a pill (toolPill) or a
+  // control labelled with a known tool name counts by being there. The prompt, the "+" button and attachments are
+  // never one.
+  function activeTool() {
+    if (!SELECTORS.toolsButton.length) return null;
+    const root = composerRoot();
+    if (!root) return null;
+    const box = composer();
+    const plus = firstVisible(SELECTORS.toolsButton, root);
+    const chips = attachmentChips();
+    const pillSel = SELECTORS.toolPill.join(', ');
+    const names = [...new Set([...state.toolLabels, ...SELECTORS.toolNames].map(toolKey))].filter(Boolean);
+    const cands = [...new Set([...all(SELECTORS.toolPill, root), ...all(['button', '[role="button"]', '[aria-pressed]'], root)])].sort(byDocumentOrder);
+    for (const el of cands) {
+      if (!visible(el) || el.getAttribute('aria-pressed') === 'false') continue;
+      if (box && (box.contains(el) || el.contains(box))) continue;
+      if (plus && (plus === el || plus.contains(el) || el.contains(plus))) continue;
+      if (chips.some((c) => c.contains(el) || el.contains(c))) continue;
+      const label = toolNameOf(el.getAttribute('aria-label') || textLines(el)[0] || '');
+      if (!label || NOT_A_TOOL.test(label)) continue;
+      const key = toolKey(label);
+      const known = names.some((n) => key === n || key.startsWith(`${n} `) || key.startsWith(`${n},`));
+      let pill = false;
+      try {
+        pill = !!pillSel && el.matches(pillSel);
+      } catch {
+        // selector unsupported by this Chrome build
+      }
+      if (known || (pill && label.length <= 40)) return { label, el };
+    }
+    return null;
+  }
+
+  // Turns the active tool off: the pill's remove control, the pill itself when it says "click to remove", or a pressed
+  // toggle pressed again. The server checks the result (and falls back to the "+" menu).
+  function toolClear() {
+    const t = activeTool();
+    if (!t) return { pressed: null, tool: null };
+    const ok = (b) => !/file|文件/i.test(b.getAttribute('aria-label') || '') && !attachmentChips().some((c) => c.contains(b));
+    const inside = all(SELECTORS.toolRemove, t.el).filter(ok);
+    let btn = inside.find(visible) || inside[0] || null;
+    if (!btn && /remove|移除|删除/i.test(t.el.getAttribute('aria-label') || '')) btn = t.el;
+    if (!btn && t.el.parentElement) btn = all(SELECTORS.toolRemove, t.el.parentElement).filter(ok).find(visible) || null;
+    if (!btn && t.el.getAttribute('aria-pressed') === 'true') btn = t.el;
+    if (!btn) return { pressed: null, tool: t.label, reason: `no remove control found on the "${t.label}" pill` };
+    press(btn);
+    return { pressed: describe(btn), tool: t.label };
+  }
+
+  // ---------------------------------------------------------------- Deep Research state (UNVERIFIED)
+
+  // Text of the current reply outside its Markdown, its thinking panels and its buttons: status rows such as
+  // "Researching…" / "Research completed in 12m". Short lines only, so a thought summary is not taken for one.
+  function cardLines(parts) {
+    const skipSel = [SELECTORS.markdown, SELECTORS.replyExclude, '.sr-only', 'script', 'style', 'svg', 'button'].filter(Boolean).join(', ');
+    const lines = [];
+    for (const part of parts) {
+      const walker = document.createTreeWalker(part, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
+        acceptNode: (n) => (n.nodeType === 1 ? (n.matches(skipSel) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_SKIP) : NodeFilter.FILTER_ACCEPT),
+      });
+      for (let n = walker.nextNode(); n && lines.length < 200; n = walker.nextNode()) {
+        const t = n.data.replace(/\s+/g, ' ').trim();
+        if (t) lines.push(t);
+      }
+    }
+    return lines;
+  }
+
+  // active: a research-specific sign that it is still running (a "stop research" control, a status row such as
+  // "Researching…"); progress: a progress indicator in the reply (only counts for a research send, see the server);
+  // completed: a "Research completed …" row; frame: the reply holds an iframe (a report there is unreadable from here
+  // unless it is same-origin); hash: of the status rows, so the server sees them change.
+  function researchState(parts) {
+    const none = { active: false, progress: false, completed: false, frame: false, label: null, hash: null };
+    if (!parts.length || !(SELECTORS.researchBusyText || SELECTORS.researchBusy.length)) return none;
+    const lines = cardLines(parts);
+    const short = lines.filter((l) => l.length <= 80);
+    const outsideMd = (sel) => parts.flatMap((p) => all(sel, p)).find((el) => visible(el) && !el.closest(SELECTORS.markdown)) || null;
+    const busyEl = outsideMd(SELECTORS.researchBusy);
+    const busyLine = (SELECTORS.researchBusyText && short.find((l) => SELECTORS.researchBusyText.test(l))) || null;
+    const doneLine = (SELECTORS.researchDoneText && short.find((l) => SELECTORS.researchDoneText.test(l))) || null;
+    const progressEl = outsideMd(SELECTORS.researchProgress);
+    return {
+      active: !doneLine && !!(busyEl || busyLine),
+      progress: !doneLine && !!progressEl,
+      completed: !!doneLine,
+      frame: parts.some((p) => !!p.querySelector('iframe')),
+      label: busyLine || (busyEl ? describe(busyEl) : doneLine),
+      hash: hash(lines.join('\n')),
+    };
   }
 
   // ---------------------------------------------------------------- projects (ChatGPT)
@@ -1159,6 +1350,28 @@
     return chips.filter((c) => !chips.some((o) => o !== c && o.el.contains(c.el)));
   }
 
+  // Export / download controls of a report (UNVERIFIED: Deep Research) in the reply, or in an open dialog showing a
+  // report (a report view): kind "export", named by their label; menu = it opens a menu of formats.
+  function exportControls(parts) {
+    if (!SELECTORS.exportLabel) return [];
+    const scopes = [...parts, ...all('[role="dialog"]').filter((d) => visible(d) && d.querySelector(SELECTORS.markdown))];
+    const found = new Set();
+    for (const s of scopes) for (const el of all(SELECTORS.exportControl, s)) found.add(el);
+    const labelled = (el) => fileKey(el.getAttribute('aria-label') || el.textContent);
+    const hits = [...found]
+      .sort(byDocumentOrder)
+      .filter((el) => visible(el) && !el.closest(SELECTORS.markdown) && !chipFile(el) && SELECTORS.exportLabel.test(labelled(el)));
+    return outermost(hits).map((el) => {
+      const popup = el.getAttribute('aria-haspopup');
+      return { el, kind: 'export', name: labelled(el), label: labelled(el), menu: popup === 'menu' || popup === 'true' || el.hasAttribute('aria-expanded') };
+    });
+  }
+
+  // File chips first, then export controls; list_files' index refers to this order.
+  function replyFiles(parts) {
+    return [...fileChips(parts), ...exportControls(parts)];
+  }
+
   function filesList({ message }) {
     if (!SELECTORS.fileChip.length) return { supported: false, conversation_id: conversationId(), files: [] };
     const r = replyAt(message);
@@ -1170,17 +1383,19 @@
       // false: the latest message is the user's, so this is the reply before it
       current: r.current,
       generating: generating(),
-      files: fileChips(r.parts).map(({ kind, name, label }, index) => ({ index, name, kind, label })),
+      files: replyFiles(r.parts).map(({ kind, name, label, menu }, index) => ({ index, name, kind, label, ...(kind === 'export' && { menu }) })),
     };
   }
 
   function fileClick({ message, index, name }) {
-    const chip = fileChips(replyAt(message).parts)[index];
+    const chip = replyFiles(replyAt(message).parts)[index];
     if (!chip || chip.name !== name) throw fail('FILE_CHANGED', `the reply no longer shows "${name}" as file ${index} — call list_files again; nothing was clicked`);
     if (chip.kind === 'preview') {
       // What is on the page before the click, so the panel is told apart by what appears.
       state.preview = { name, chip: chip.el, controls: new Set(previewControls()), panels: new Set(all(SELECTORS.previewPanel)), control: null, panel: null };
     }
+    // An export control may open a menu of formats: read afterwards with model_menu_read (new items only).
+    if (chip.kind === 'export') state.menuBaseline = new Set(menuItems(null));
     press(chip.el);
     return { clicked: true, kind: chip.kind, name };
   }
@@ -1441,15 +1656,46 @@
       .join('\n');
   }
 
+  // Documents of the iframes in a reply that this script may read (same-origin); cross-origin ones are counted.
+  function frameDocs(parts) {
+    const docs = [];
+    let unreadable = 0;
+    for (const f of parts.flatMap((p) => [...p.querySelectorAll('iframe')])) {
+      let doc = null;
+      try {
+        doc = f.contentDocument;
+      } catch {
+        // cross-origin
+      }
+      if (doc?.body) docs.push(doc);
+      else unreadable++;
+    }
+    return { docs, unreadable };
+  }
+
   function extractReply() {
     const info = threadInfo();
     if (!info.replyParts.length) throw fail('NO_REPLY', 'there is no assistant reply after the latest user message');
     // 2026-11 layout: the "Thought for …" and tool rows are separate assistant blocks without Markdown;
     // they are left out whenever some block has Markdown. Without any, the blocks' text is the reply.
-    const roots = info.replyParts.flatMap(markdownRoots);
+    let roots = info.replyParts.flatMap(markdownRoots);
+    let source = 'markdown';
+    // A report rendered in a same-origin iframe (UNVERIFIED for Deep Research): its Markdown, links kept.
+    const frames = frameDocs(info.replyParts);
+    if (!roots.length && frames.docs.length) {
+      roots = frames.docs.flatMap((d) => markdownRoots(d.body));
+      source = 'frame';
+    }
+    if (!roots.length) source = 'text';
     const parts = roots.length ? roots.map((r) => blocks(r).join('\n\n')) : info.replyParts.map((m) => m.innerText.trim());
     const markdown = parts.filter(Boolean).join('\n\n').trim();
-    return { markdown: markdown ? `${markdown}\n` : '', conversation_id: conversationId(), message_id: info.last_assistant_id };
+    return {
+      markdown: markdown ? `${markdown}\n` : '',
+      conversation_id: conversationId(),
+      message_id: info.last_assistant_id,
+      source,
+      frames_unreadable: frames.unreadable,
+    };
   }
 
   // ---------------------------------------------------------------- inspect_page (read-only)
@@ -1514,6 +1760,56 @@
     return { url: location.href, selector, matched: roots.length, nodes: count, truncated, tree: lines.join('\n') };
   }
 
+  // ---------------------------------------------------------------- MCP tab marker
+  //
+  // 2026-11-22 the user switched the MCP tab to another conversation by hand while a reply was generating. The tab
+  // now says what it is: "[MCP] " before its title — kept there by an observer, as the site rewrites document.title
+  // on every route change (an observer is no timer) — and a small badge at the bottom of <body> (outside main / form /
+  // menus) that takes no clicks and is hidden from screen readers. Idempotent across injections. Never while the page
+  // is still loading or on the "ready" probe of open_conversation, so the site's hydration never sees either.
+
+  const TITLE_PREFIX = '[MCP] ';
+  const BADGE_TEXT = 'MCP tab · driven by Claude Code — please don’t switch conversations here';
+
+  function markTab() {
+    if (document.readyState !== 'complete') return;
+    try {
+      const fix = () => {
+        if (!document.title.startsWith(TITLE_PREFIX)) document.title = TITLE_PREFIX + document.title;
+      };
+      fix();
+      const g = globalThis;
+      if (!g.__mcpTitleObserver) {
+        let burst = { at: 0, n: 0 };
+        const obs = new MutationObserver(() => {
+          if (document.title.startsWith(TITLE_PREFIX)) return;
+          // Never fight the page: give up after 30 rewrites within a second.
+          const now = Date.now();
+          burst = now - burst.at > 1_000 ? { at: now, n: 1 } : { at: burst.at, n: burst.n + 1 };
+          if (burst.n > 30) {
+            obs.disconnect();
+            return;
+          }
+          fix();
+        });
+        obs.observe(document.head || document.documentElement, { subtree: true, childList: true, characterData: true });
+        g.__mcpTitleObserver = obs;
+      }
+      if (!document.querySelector('[data-mcp-badge]')) {
+        const b = document.createElement('div');
+        b.setAttribute('data-mcp-badge', '');
+        b.setAttribute('aria-hidden', 'true');
+        b.textContent = BADGE_TEXT;
+        b.style.cssText =
+          'all:initial;position:fixed;z-index:2147483646;left:50%;bottom:2px;transform:translateX(-50%);pointer-events:none;user-select:none;' +
+          'font:600 10px/14px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#fff;background:rgba(194,65,12,.82);padding:1px 8px;border-radius:7px;white-space:nowrap;';
+        (document.body || document.documentElement).append(b);
+      }
+    } catch {
+      // cosmetic only: never let it break a command
+    }
+  }
+
   // ---------------------------------------------------------------- dispatch
 
   const HANDLERS = {
@@ -1545,6 +1841,12 @@
     model_menu_choose: chooseModelItem,
     model_menu_slider_key: sliderKey,
     model_menu_close: closeModelMenu,
+    tools_menu_open: openToolsMenu,
+    tools_menu_read: readToolsMenu,
+    tools_menu_choose: chooseTool,
+    tools_menu_close: (a) => closeModelMenu({ ...a, which: 'tools' }),
+    tool_state: () => ({ tool: activeTool()?.label ?? null, supported: SELECTORS.toolsButton.length > 0 }),
+    tool_clear: toolClear,
     list_projects: () => ({ projects: [...new Set(projectButtons().map((p) => p.name))] }),
     open_project: openProject,
     files_list: filesList,
@@ -1557,6 +1859,7 @@
   };
 
   async function handle(cmd, args) {
+    if (cmd !== 'ready' && cmd !== 'visibility') markTab();
     const fn = HANDLERS[cmd];
     if (!fn) return { ok: false, error: { code: 'UNKNOWN_COMMAND', message: `unknown page command: ${cmd}` } };
     try {
