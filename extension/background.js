@@ -239,7 +239,7 @@ function installFileChooserHook() {
 
 const DOWNLOAD_HOSTS = {
   chatgpt: /(^|\.)(chatgpt\.com|openai\.com|oaiusercontent\.com|oaistatic\.com)$/,
-  gemini: /(^|\.)(gemini\.google\.com|googleusercontent\.com)$/,
+  gemini: /(^|\.)(gemini\.google\.com|googleusercontent\.com|usercontent\.google\.com)$/,
 };
 const DOWNLOAD_DEFAULTS = {
   timeout_ms: 60_000, // the whole capture, from the press to a finished file

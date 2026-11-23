@@ -55,6 +55,8 @@ const DOWNLOAD_PHASES = Object.fromEntries(
 );
 const PREVIEW_OPEN_MS = 8_000; // a preview panel must show up this long after the press
 const PREVIEW_SETTLE_MS = 2_500; // an open panel gets this long to show its download button
+const SHOWN_RENDER_MS = 1_500; // a Gemini tab just brought forward gets this long to render its file cards
+const PREVIEW_DIALOG_MS = 1_200; // … and a dialog this long to come up after the press before its control is used
 // show_tab: how long the page gets to report itself visible after being brought forward (env: tests only).
 const SHOW_TAB_MS = Number(process.env.CHATGPT_BRIDGE_SHOW_TAB_MS) || 3_000;
 // What upload_files / send_message do when the MCP tab is hidden. Gemini holds a clicked Send until the tab is shown
@@ -1638,16 +1640,57 @@ async function saveCaptured(site, request, target, meta) {
   return out;
 }
 
-// A preview chip opens a panel: its download button is pressed and caught like a chip; without one (or when that
-// starts no download) the text the panel shows is saved instead and flagged via "preview-text".
-async function savePreview(site, chip, click, timing, target) {
+// Files whose bytes the text of a panel can never stand for: no "preview-text" fallback for them.
+const BINARY_FILE = /\.(docx?|xlsx?|pptx?|pdf|zip|gz|tgz|tar|7z|rar|png|jpe?g|gif|webp|bmp|ico|mp[34]|mov|wav|m4a|woff2?|ttf|otf|exe|dmg|bin|so|dylib|whl|jar|apk|ipa|npy|npz|pt|pth|onnx|safetensors|parquet|sqlite|db)$/i;
+
+// The inspect outline of what is open as a menu or popover, for EXPORT_MENU_EMPTY.
+async function menuOutline(site) {
+  const r = await page(site, 'inspect', { selector: `${MENU_CONTAINERS}, gem-popover`, depth: 8, max_nodes: 120, visible_only: true }, 20_000).catch(() => null);
+  return r?.tree ? `; menus / popovers now:\n${r.tree}` : '; no menu or popover is open';
+}
+
+// A dialog the page put up after the press (file_preview_state.dialog): reported, never answered.
+function dialogError(chip, d) {
+  return new ToolError(
+    'PAGE_DIALOG',
+    `pressing "${chip.label || chip.name}" made the page ask: "${d.text}"${d.buttons?.length ? ` (buttons: ${d.buttons.join(', ')})` : ''} — nothing was pressed in it and nothing was downloaded; answer it in the MCP tab (show_tab), then retry`,
+    { dialog: d },
+  );
+}
+
+// The panel's download control opens a menu (Gemini's "Export"): pressed without a capture, then the format is chosen
+// there like a report export (pickFormat) and that press is caught.
+async function savePreviewMenu(site, chip, timing, target, format) {
+  await page(site, 'file_preview_download', { name: chip.name });
+  try {
+    const items = await readMenu(site, 0);
+    if (!items.length) {
+      const st = await page(site, 'file_preview_state', { name: chip.name }).catch(() => null);
+      if (st?.dialog) throw dialogError(chip, st.dialog);
+      throw new ToolError('EXPORT_MENU_EMPTY', `pressed the panel's export control for "${chip.name}" but no menu of formats appeared — fix menuContainers / previewDownload in extension/content.js${await menuOutline(site)}`);
+    }
+    const hit = pickFormat(items, format);
+    return await saveCaptured(site, { cmd: 'model_menu_choose', args: { index: hit.index, label: hit.label }, name: chip.name, ...timing }, target, { name: chip.name, kind: chip.kind, via: 'preview-export', format: hit.label });
+  } finally {
+    await closeModelMenu(site).catch(() => {});
+  }
+}
+
+// A preview chip opens a panel (Gemini: "Open" a file or a Canvas): its download button is pressed and caught like a
+// chip — or, when it opens a menu, a format is chosen there; without one (or when that starts no download) the text the
+// panel shows is saved instead and flagged via "preview-text" — never for a binary file or one whose name is unknown.
+async function savePreview(site, chip, click, timing, target, format = null) {
   await page(site, 'file_click', click);
   try {
     let st = null;
     let openSince = null;
-    for (const end = Date.now() + PREVIEW_OPEN_MS; Date.now() < end; await sleep(400)) {
+    // A control seen at once may belong to a panel that was already open (a Canvas reopened in place): give the page a
+    // moment to put up a dialog first.
+    const pressedAt = Date.now();
+    for (const end = pressedAt + PREVIEW_OPEN_MS; Date.now() < end; await sleep(400)) {
       st = await page(site, 'file_preview_state', { name: chip.name });
-      if (st.download) break;
+      if (st.dialog) throw dialogError(chip, st.dialog);
+      if (st.download && Date.now() - pressedAt >= PREVIEW_DIALOG_MS) break;
       if (st.open && Date.now() - (openSince ??= Date.now()) > PREVIEW_SETTLE_MS) break;
     }
     if (!st?.open) {
@@ -1659,11 +1702,15 @@ async function savePreview(site, chip, click, timing, target) {
     let why = 'the preview shows no download button';
     if (st.download) {
       try {
+        if (st.menu) return await savePreviewMenu(site, chip, timing, target, format);
         return await saveCaptured(site, { cmd: 'file_preview_download', args: { name: chip.name }, name: chip.name, ...timing }, target, { name: chip.name, kind: chip.kind, via: 'preview-download' });
       } catch (e) {
         if (e.code !== 'DOWNLOAD_NOT_STARTED' && e.code !== 'PREVIEW_NO_DOWNLOAD') throw e;
         why = `its download button started nothing (${e.message})`;
       }
+    }
+    if (!target.file || BINARY_FILE.test(chip.name)) {
+      throw new ToolError('PREVIEW_NO_DOWNLOAD', `${why} — and the text the panel shows cannot stand in for ${target.file ? `a binary file (${chip.name})` : `"${chip.name}"`}; nothing was saved${st.outline ? `; open panels:\n${st.outline}` : ''}`);
     }
     const t = await page(site, 'file_preview_text', { name: chip.name });
     if (!t?.text?.trim()) throw new ToolError('PREVIEW_UNREADABLE', `${why}, and the panel shows no text (${t?.source || 'nothing found'})`);
@@ -1679,9 +1726,10 @@ async function savePreview(site, chip, click, timing, target) {
   }
 }
 
-// A report's export control (kind "export", UNVERIFIED: Deep Research): pressed and caught like a chip; one that opens
-// a menu of formats gets `format` (or Markdown, else PDF, else Word, else the only one) chosen there instead.
-const EXPORT_SKIP = /copy|share|link|print|复制|分享|链接|打印/i;
+// A report's export control (kind "export": ChatGPT Deep Research, UNVERIFIED; Gemini Canvas): pressed and caught like a
+// chip; one that opens a menu of formats gets `format` (or Markdown, else PDF, else Word, else the only one) chosen
+// there instead. Items that copy, share or send the file somewhere (Drive, Docs, Google Sites, …) are never pressed.
+const EXPORT_SKIP = /copy|share|link|print|drive|google|\bdocs\b|\bsheets\b|\bsites?\b|gmail|colab|replit|复制|分享|链接|打印|云端硬盘|谷歌/i;
 
 function pickFormat(items, format) {
   const usable = items.filter((i) => !i.submenu && i.kind !== 'slider' && !i.disabled && !EXPORT_SKIP.test(i.label));
@@ -1705,7 +1753,7 @@ async function saveExport(site, chip, click, timing, target, format) {
   await page(site, 'file_click', click);
   try {
     const items = await readMenu(site, 0);
-    if (!items.length) throw new ToolError('EXPORT_MENU_EMPTY', `pressed "${chip.label || chip.name}" but no menu of formats appeared — fix exportControl / exportLabel in extension/content.js`);
+    if (!items.length) throw new ToolError('EXPORT_MENU_EMPTY', `pressed "${chip.label || chip.name}" but no menu of formats appeared — fix exportControl / exportLabel / menuContainers in extension/content.js${await menuOutline(site)}`);
     const hit = pickFormat(items, format);
     return await saveCaptured(site, { cmd: 'model_menu_choose', args: { index: hit.index, label: hit.label }, name: chip.name, ...timing }, target, { ...meta, format: hit.label });
   } finally {
@@ -1862,7 +1910,7 @@ const TOOLS = [
   {
     name: 'list_files',
     description:
-      'List the files offered for download in an assistant reply of the MCP tab (ChatGPT shows them as inline chips, e.g. generated .patch / .md files). Returns { site, supported, conversation_id, message, replies, current, generating, files: [{ index, name, kind, label }] }: kind "download" is a direct download chip, "preview" opens a preview panel, "export" is a report\'s export / download control (Deep Research, UNVERIFIED; menu=true: it offers formats, see download_file format); index tells files of the same name apart. message: "latest" (default) or how many replies back (0 = latest; long ChatGPT threads keep only the latest turn in the page). current=false means the latest message is the user\'s, so this reply precedes it. Gemini: supported=false and no files. PAGE_STALE: see get_status. Clicks nothing; read-only.',
+      'List the files offered for download in an assistant reply of the MCP tab (ChatGPT: inline chips, e.g. generated .patch / .md files; Gemini: generated-file cards such as DOCX / ZIP, and Canvas documents or code). Returns { site, supported, conversation_id, message, replies, current, generating, files: [{ index, name, kind, label, type?, menu? }] }: kind "download" is a direct download chip, "preview" opens a preview panel (Gemini: "Open" — a viewer whose Export menu downloads it), "export" is an export control (ChatGPT Deep Research report, UNVERIFIED; Gemini: the Canvas shown in the reply, or a file card opened into a preview, named by its title; menu=true: it offers formats, see download_file format), "canvas" a Gemini Canvas card (exported through the Canvas of that title expanded on the page, else opened first); type: the type a Gemini card shows ("DOCX"; name then ends in ".docx"); index tells files of the same name apart. message: "latest" (default) or how many replies back (0 = latest; long ChatGPT threads keep only the latest turn in the page). current=false means the latest message is the user\'s, so this reply precedes it. files_pending (Gemini): cards not rendered yet because the tab is hidden — show_tab, then list again (with a warning). PAGE_STALE: see get_status. Clicks nothing; read-only.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1876,7 +1924,7 @@ const TOOLS = [
   {
     name: 'download_file',
     description:
-      'Save a file from an assistant reply (see list_files) to a local path. Presses its chip in the MCP tab, catches the browser download it starts (or, if the page is held back, fetches the URL the page tried to open), copies the file to save_to and deletes Chrome\'s own copy (only that download) from the Downloads folder and the download list. A preview chip opens its panel and uses the panel\'s download button; without one, the text the panel shows is saved with via: "preview-text" and a warning (not byte-exact). An export entry (a report\'s export control) is pressed — choosing `format` in its menu if it has one (default: Markdown, else PDF, else Word) — and saved under the downloaded file\'s name when save_to is a directory (via: "export"). Sends no message. Pick the file by name or index (from list_files), or both, which must then agree: name must equal the file name exactly; a name shown more than once → AMBIGUOUS_FILE (pass index); neither → INVALID_ARGUMENT. save_to: absolute directory (the file keeps its name) or file path; an existing file → FILE_EXISTS unless overwrite=true; symlinks at the target are replaced, never written through. Returns { path, size, sha256, name, kind, via: "download" | "preview-download" | "preview-text" | "export", capture?, mime?, format?, warning? }. Errors: FILE_NOT_IN_REPLY, AMBIGUOUS_FILE, FILE_EXISTS, FORMAT_NOT_FOUND, DOWNLOAD_NOT_STARTED, DOWNLOAD_PROMPTED (Chrome asks where to save), DOWNLOAD_TIMEOUT, DOWNLOAD_FAILED, NOT_SUPPORTED (Gemini), PAGE_STALE (see get_status; nothing pressed).',
+      'Save a file from an assistant reply (see list_files) to a local path. Presses its chip in the MCP tab, catches the browser download it starts (or, if the page is held back, fetches the URL the page tried to open), copies the file to save_to and deletes Chrome\'s own copy (only that download) from the Downloads folder and the download list. A preview chip opens its panel and uses the panel\'s download button; without one, the text the panel shows is saved with via: "preview-text" and a warning (not byte-exact). An export entry (a report\'s export control, a Gemini Canvas or opened file preview) is pressed — choosing `format` in its menu if it has one (default: Markdown, else PDF, else Word, else the only item left; items that copy, share or send it to Drive / Docs / Google Sites are never pressed) — and saved under the downloaded file\'s name when save_to is a directory (via: "export"; a "canvas" entry goes through the Canvas of that title the page shows expanded, else is opened first). A preview whose panel offers an Export menu (Gemini "Open" on a DOCX: Export → Download) chooses there too (via: "preview-export"). A binary file (DOCX, PDF, ZIP, …) is never replaced by the panel\'s text: PREVIEW_NO_DOWNLOAD instead. Gemini renders file cards and opens previews only in a visible tab, so there the tab is brought forward first (on_hidden, Gemini default "show"; returns tab_shown). Sends no message. Pick the file by name or index (from list_files), or both, which must then agree: name must equal the file name exactly; a name shown more than once → AMBIGUOUS_FILE (pass index); neither → INVALID_ARGUMENT. save_to: absolute directory (the file keeps its name) or file path; an existing file → FILE_EXISTS unless overwrite=true; symlinks at the target are replaced, never written through. Returns { path, size, sha256, name, kind, via: "download" | "preview-download" | "preview-export" | "preview-text" | "export", capture?, mime?, format?, tab_shown?, warning? }. Errors: FILE_NOT_IN_REPLY, AMBIGUOUS_FILE, FILE_EXISTS, FORMAT_NOT_FOUND, EXPORT_MENU_EMPTY, PREVIEW_NOT_FOUND, PREVIEW_NO_DOWNLOAD, PAGE_DIALOG (the page asks something, e.g. "Allow" — never answered; error.dialog has its text and buttons), TAB_HIDDEN, DOWNLOAD_NOT_STARTED, DOWNLOAD_PROMPTED (Chrome asks where to save), DOWNLOAD_TIMEOUT, DOWNLOAD_FAILED, PAGE_STALE (see get_status; nothing pressed).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1886,7 +1934,8 @@ const TOOLS = [
         index: { type: 'integer', minimum: 0, description: 'index from list_files: picks the file on its own, or one of several files with the same name together with name' },
         overwrite: { type: 'boolean', default: false },
         timeout_seconds: { type: 'number', default: DOWNLOAD_TIMEOUT_S, description: 'how long the download may take (2–600 s)' },
-        format: { type: 'string', description: 'export entries only: the format to pick in the export menu, e.g. "PDF", "Markdown", "Word"' },
+        on_hidden: ON_HIDDEN_PROPERTY,
+        format: { type: 'string', description: 'when the file is saved through an export menu (export / canvas entries, a preview panel\'s Export): the item to pick, e.g. "PDF", "Markdown", ".md", "Download code"; default: Markdown, else PDF, else Word, else the only item left' },
         site: SITE_PROPERTY,
       },
       required: ['save_to'],
@@ -2229,7 +2278,11 @@ const handlers = {
     ensureConnected();
     const r = await page(site, 'files_list', { message }).catch(rethrowOutdated);
     await assertFreshListing(site, r, 'Nothing was listed');
-    return { site, ...r };
+    const out = { site, ...r };
+    if (r.files_pending) {
+      out.warning = `${r.files_pending} file card(s) in this reply have not rendered (Gemini renders them, and an opened file's preview, only while its tab is visible) and are missing from files — call show_tab, then list_files again (download_file brings the tab forward itself)`;
+    }
+    return out;
   },
 
   async download_file(args) {
@@ -2242,20 +2295,31 @@ const handlers = {
     const timeoutS = optNumber(args, 'timeout_seconds', DOWNLOAD_TIMEOUT_S, 2, 600);
     const format = args.format == null ? null : requireString(args, 'format');
     if (typeof args.save_to !== 'string' || !path.isAbsolute(args.save_to)) throw new ToolError('INVALID_ARGUMENT', '"save_to" must be an absolute directory or file path');
+    const onHidden = optOnHidden(args, site);
     ensureConnected();
     return oneDownloadAtATime(async () => {
+      // Gemini renders its file cards — and opens a file's preview — only while the tab is visible: brought forward first
+      // (on_hidden), and given a moment to render.
+      const s = onHidden === 'proceed' ? null : await page(site, 'snapshot', {}, 10_000);
+      const shown = await ensureVisible(site, onHidden, s, 'pressed or downloaded');
+      if (shown) await sleep(SHOWN_RENDER_MS);
       const listing = await page(site, 'files_list', { message }).catch(rethrowOutdated);
       await assertFreshListing(site, listing, 'Nothing was pressed or downloaded');
       if (!listing.supported) throw new ToolError('NOT_SUPPORTED', `downloading reply files is not supported on ${site} yet`);
       const chip = pickFile(listing.files, name, index);
-      // Checked before anything is pressed: a bad or taken target downloads nothing (an export into a directory takes
-      // the downloaded file's name, checked once it is known).
-      const target = await downloadTarget(args.save_to, chip.kind === 'export' ? null : chip.name, overwrite);
+      // Checked before anything is pressed: a bad or taken target downloads nothing (an export or a Canvas into a
+      // directory takes the downloaded file's name, checked once it is known).
+      const unnamed = chip.kind === 'export' || chip.kind === 'canvas';
+      const target = await downloadTarget(args.save_to, unnamed ? null : chip.name, overwrite);
       const timing = { timeout_ms: timeoutS * 1000, ...DOWNLOAD_PHASES };
       const click = { message: listing.message, index: chip.index, name: chip.name };
-      if (chip.kind === 'preview') return savePreview(site, chip, click, timing, target);
-      if (chip.kind === 'export') return saveExport(site, chip, click, timing, target, format);
-      return saveCaptured(site, { cmd: 'file_click', args: click, name: chip.name, ...timing }, target, { name: chip.name, kind: chip.kind, via: 'download' });
+      const save = async () => {
+        if (chip.kind === 'preview' || chip.kind === 'canvas') return savePreview(site, chip, click, timing, target, format);
+        if (chip.kind === 'export') return saveExport(site, chip, click, timing, target, format);
+        return saveCaptured(site, { cmd: 'file_click', args: click, name: chip.name, ...timing }, target, { name: chip.name, kind: chip.kind, via: 'download' });
+      };
+      const out = await save();
+      return shown ? { ...out, tab_shown: true } : out;
     });
   },
 
@@ -2286,7 +2350,7 @@ ChatGPT Deep Research is OPT-IN only and never turned on by default: use it only
 select_model switches the model ("Pro", "Thinking", …) and mode (ChatGPT "Work", Gemini "Task" — on a new chat) by the text shown in the page; call it without arguments to list the options. New Gemini chats are put in Task mode by default (open_conversation, and checked again before upload_files / send_message: MODE_NOT_SET, nothing typed, if it cannot be set); an explicit mode ("Chat") wins until the next open_conversation.
 Every tool takes an optional site ("chatgpt" | "gemini"), defaulting to the site of the most recent open_conversation; pass it explicitly when working with both sites at once.
 Prefer save_to for long replies so the full text stays out of context.
-Files a reply offers (ChatGPT's inline file chips): list_files shows them, download_file saves one to a local path and returns its size and sha256 — no message is sent.
+Files a reply offers (ChatGPT's inline file chips; Gemini's file cards — DOCX, ZIP, … — and Canvas documents / code): list_files shows them, download_file saves one to a local path and returns its size and sha256 — no message is sent (export menus: format picks the entry, Drive / Google Sites are never pressed).
 Never re-send after a failed or unconfirmed send_message — call get_status first; every send spends the user's quota.
 Gemini holds a clicked Send (Chat and Task mode alike) and shows no attachment previews while its tab is hidden, so on Gemini upload_files / send_message first bring the tab to the front (on_hidden: "show", same as show_tab) and fail with TAB_HIDDEN, touching nothing, if it stays hidden (minimized or covered window) — ask the user to show the tab, then retry.
 send_message's expect_conversation_id: "new" asserts the tab is on an empty new chat.

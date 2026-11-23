@@ -35,7 +35,7 @@ claude mcp add --scope user chatgpt-web -- "$(which node)" "$PWD/server/server.m
 | `get_latest_reply({ wait_seconds, save_to, overwrite, expect_conversation_id })` | 最多阻塞 45 s；未完成返回 `job_id` 和 `wait_command`（Deep Research 进行中另带 `researching: true`）；`save_to` 时只回元数据。报过 `SEND_NOT_OBSERVED` 之后再调用，会按页面现状读最新回复并附 `warning`（回复可能早于那条消息）。页面可能不是 URL 所示的对话时报 `PAGE_STALE`，什么都不读不存；`expect_conversation_id` 不符报 `CONVERSATION_MISMATCH` |
 | `get_job({ job_id, wait_seconds })` | 继续等待后台任务 |
 | `select_model({ model, mode, tool, outline })` | 按页面上的文字切换模型、模式和输入框工具（ChatGPT `Chat`/`Work`，Gemini `Chat`/`Task`，后者仅新对话页有）。`tool`：打开 ChatGPT 输入框「+」菜单（`Add files and more`）里的工具，如 `"Deep research"`（它既不是模型也不是模式；只能显式开启），必要时进「More」子菜单；菜单里已显示选中的不再点（再点会关掉）；`tool: "none"` 关掉所有工具（输入框上的移除按钮，否则在「+」菜单里再点一次选中项）；结果在页面上核对——先看输入框，认不出时看「+」菜单是否显示选中（返回 `tool_confirmed_by: "composer" | "menu"`），都核对不到报 `TOOL_NOT_CONFIRMED`；添加文件/照片的菜单项永远不点。不带 `model` / `mode` / `tool` 时也列出「+」菜单（返回 `tools: [{ label, description, selected, disabled, submenu, in }]`，`in` 为所在子菜单），列不出来只附 `warning`、不报错；只给 `tool` 时不打开模型菜单（`models: null`）。返回值另有 `tool`（当前工具或 `null`）。显式给的 `mode` 记为这个新对话的选择，直到下一次 `open_conversation` 都不会被默认模式切回（页面上没有切换按钮时报 `MODE_TOGGLE_NOT_FOUND`，但同样记下）；只给 `model` 不给 `mode` 时，Gemini 新对话先切到默认的 Task 再选模型。`model` 先匹配选项名再匹配副标题（Gemini 的 `"Neon"`、`"Carbon"`），再进子菜单，最后用方向键调 ChatGPT 的 Power 滑块（如 `"Pro"`）；不带参数只列出可选项；匹配有歧义时拒绝点击；`outline` 附带打开时的菜单 DOM 大纲，用于修选择器 |
-| `list_files({ message })` | 只读（页面过期时报 `PAGE_STALE`）：列出某条助手回复里可下载的文件（ChatGPT 回复里的行内文件 chip）。`message`：`"latest"`（默认）或往前数第几条回复（0 = 最新；长对话页面里通常只有最新一轮）。返回 `{ site, supported, conversation_id, message, replies, current, generating, files: [{ index, name, kind, label, menu? }] }`，`kind`：`download`（直接下载）/ `preview`（打开预览面板）/ `export`（报告的导出/下载按钮，Deep Research，**UNVERIFIED**；`menu: true` 表示点开是格式菜单）；`current: false` 表示最新消息是用户的、这条是它之前的回复。Gemini：`supported: false`、空列表 |
+| `list_files({ message })` | 只读（页面过期时报 `PAGE_STALE`）：列出某条助手回复里可下载的文件（ChatGPT 回复里的行内文件 chip；Gemini 的文件卡片和 Canvas，见下文）。`message`：`"latest"`（默认）或往前数第几条回复（0 = 最新；长对话页面里通常只有最新一轮）。返回 `{ site, supported, conversation_id, message, replies, current, generating, files: [{ index, name, kind, label, type?, menu? }] }`，`kind`：`download`（直接下载）/ `preview`（打开预览面板）/ `export`（导出按钮：ChatGPT Deep Research 报告，**UNVERIFIED**；Gemini 回复里展开的 Canvas，按标题命名；`menu: true` 表示点开是格式菜单）/ `canvas`（Gemini 较早版本的 Canvas 卡片，先打开再导出）；`type`：Gemini 卡片显示的类型（`DOCX`，此时 `name` 以 `.docx` 结尾）；`current: false` 表示最新消息是用户的、这条是它之前的回复 |
 | `download_file({ name, save_to, message, index, overwrite, timeout_seconds, format })` | 把回复里的一个文件存到本地，不发消息。`export` 项：点导出按钮，有格式菜单时按 `format`（如 `"PDF"`、`"Markdown"`）选，默认 Markdown > PDF > Word，没有对应格式报 `FORMAT_NOT_FOUND`；`save_to` 是目录时用浏览器下载下来的文件名（`via: "export"`，返回 `format`）。用 `name` 或 `index`（`list_files` 给的）指定文件，可以只给其一；两个都给时必须对得上，都不给报 `INVALID_ARGUMENT`。点该文件的 chip，用 `chrome.downloads` 抓住这次点击触发的浏览器下载，服务端复制到 `save_to` 并算 sha256，随后**只删除这一次下载**在 Chrome 下载目录里的副本并从下载列表抹掉。`name` 必须与文件名完全一致，同名出现多次报 `AMBIGUOUS_FILE`（用 `list_files` 的 `index` 指定）。`save_to` 为绝对路径：已存在的目录或以 `/` 结尾 → 存为其中的同名文件，否则就是文件路径；目标已存在且没给 `overwrite: true` 报 `FILE_EXISTS`（先检查，不会白下载）；目标处的符号链接被替换、绝不写穿。预览 chip：打开面板 → 点面板里的下载按钮；没有下载按钮（或按了没下载）时保存面板显示的文字，并标 `via: "preview-text"` 和 `warning`（不保证与原文件逐字节一致）。返回 `{ path, size, sha256, name, kind, via: "download" \| "preview-download" \| "preview-text", capture?, mime?, warning? }` |
 | `inspect_page({ selector, depth, max_nodes, visible_only })` | 只读 DOM 大纲，用于修选择器 |
 
@@ -101,9 +101,28 @@ ChatGPT 常把结果做成沙盒里的文件（`.patch` / `.md` / `.json`），�
 使用前提与限制：
 
 - Chrome 设置里「下载前询问每个文件的保存位置」要关掉，否则报 `DOWNLOAD_PROMPTED`（下载已取消；若保存对话框还开着，手动关掉）。
-- 若专属标签页提示「此网站想下载多个文件」，点允许，或在 `chrome://settings/content/automaticDownloads` 里允许 `https://chatgpt.com`。被拦住且页面没有可捕获的 https 地址时报 `DOWNLOAD_NOT_STARTED`。
+- 若专属标签页提示「此网站想下载多个文件」，点允许，或在 `chrome://settings/content/automaticDownloads` 里允许 `https://chatgpt.com`（Gemini：`https://gemini.google.com`）。被拦住且页面没有可捕获的 https 地址时报 `DOWNLOAD_NOT_STARTED`。
 - macOS 上服务端要能读 `~/Downloads`（运行 Claude Code 的终端 App 需有「下载」文件夹权限），否则报 `DOWNLOAD_UNREADABLE`。
-- Gemini 回复里的文件尚未支持：`list_files` 返回空，`download_file` 报 `NOT_SUPPORTED`。
+- 带格式菜单的导出（ChatGPT 报告、Gemini 的 Export）按 `format` 选；默认 Markdown（含 `.md`）> PDF > Word > 剩下的唯一一项。复制、分享、发到 Drive / Google 文档 / Google Sites 之类的菜单项**永远不点**（不会把文件传到别处）；只剩这些时报 `FORMAT_NOT_FOUND`。
+- 预览面板没有下载/导出按钮时，文本文件存面板里的文字（`via: "preview-text"` + `warning`）；二进制文件（DOCX、PDF、ZIP、图片…）和名字未知的 Canvas 不这么做，报 `PREVIEW_NO_DOWNLOAD`。
+
+**Gemini（2026-11-23 真页面实测）。** 回复里的文件是 `generated-file` 卡片：`.file-name-lr` 是不带扩展名的文件名，`.file-type-lr` 是类型（`DOCX`、`ZIP`），所以列表里的 `name` 是「显示名 + 小写扩展名」（`…V1.0.docx`），另给 `type`。
+
+| 页面上的样子 | `kind` | `download_file` 怎么做 | 实测 |
+| --- | --- | --- | --- |
+| 卡片带下载图标（`button[aria-label="Download <名字>"]`，如 ZIP） | `download` | 直接点，抓浏览器下载 | ✅ 32 MB ZIP |
+| 卡片带 `Open`（`button[aria-label="Open <名字>"]`，如 DOCX） | `preview` | `Open` 把卡片**就地展开**成预览（`generated-file-senna-preview` > `.senna-preview-container`）→ 预览里的 `Export` 菜单 → `Download`（不点 `Drive`）→ 收起预览，`via: "preview-export"` | ✅ 7.3 MB DOCX |
+| 已经展开的文件预览 | `export`（`name` = 预览标题） | `Export` → `Download`，存成浏览器给的文件名 | ✅ 9.3 MB DOCX |
+| 回复里展开的 Canvas（`immersive-entry-chip` > `inline-preview`） | `export`（`name` = Canvas 标题） | `Export` → 文档选 `.md`、代码选 `Download code`（不点 `Drive` / `Google Sites`） | ✅ `.md`、HTML |
+| Canvas 卡片（`button[aria-label="Open <标题> in Canvas"]`） | `canvas` | 页面上已经展开着同标题的 Canvas 时直接用它导出（这些卡片指向同一个 Canvas，时间戳都相同；对它们点 `Open` 后那个 Canvas 的 `Export` 菜单打不开），否则先点 `Open` 再导出 | ✅ 复用展开的 Canvas（与上一行下载的文件 sha256 相同）；页面上没有展开的同名 Canvas 时先点 `Open`：**UNVERIFIED** |
+
+要点：
+
+- **Gemini 只在标签页可见时渲染文件卡片和展开的预览**（隐藏时点 `Open` 不会有任何反应，等标签页显示出来才一次性展开）。所以 Gemini 上 `download_file` 先按 `on_hidden`（Gemini 默认 `"show"`）把标签页调到前台并稍等渲染，结果带 `tab_shown: true`；`list_files` 不动标签页，但会用 `files_pending` + `warning` 报告还没渲染出来的卡片（先 `show_tab` 再列）。
+- 预览标题按**完全相等**比较：页面上可以同时展开好几个预览，「X（审阅修订版）」不能当成「X」。
+- 长对话里 Gemini 只渲染一部分回复，`message`（往前数第几条回复）可能随滚动变化；按 `name` 下载时对不上会报 `FILE_NOT_IN_REPLY` / `FILE_CHANGED`，什么都不点，重新 `list_files` 即可。
+- 点 `Open` 后页面若弹出要回答的对话框（例如要求 Allow），报 `PAGE_DIALOG`（`error.dialog` 带文字和按钮），**不替你点**，什么都不下载。
+- 回复里代码块自带的「Download code」按钮和表格导出不在列表里。
 - 预览面板的选择器（`previewDownload` / `previewPanel` / `previewClose`）按「点击后新出现的元素」推断，尚未在真页面上核对；找不到面板时 `PREVIEW_NOT_FOUND` 会附上当时的面板大纲。
 
 ## 安全设计

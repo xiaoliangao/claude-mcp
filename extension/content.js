@@ -192,12 +192,41 @@
       menuSkip: [],
       projectNewChat: [],
       projectName: null,
-      // Reply file chips are not known for Gemini yet: list_files returns none, download_file NOT_SUPPORTED.
-      fileChip: [],
-      fileChipLabel: [],
-      previewDownload: [],
-      previewPanel: [],
-      previewClose: [],
+      // Files in a reply (live 2026-11-23). generated-file cards: div.chip-lr with .file-name-lr (the name without its
+      // extension), .file-type-lr ("DOCX", "ZIP") and one button — [aria-label="Download <name>"] downloads at once,
+      // [aria-label="Open <name>"] opens a viewer whose "Export" menu offers "Download" (and "Drive", never pressed).
+      // Canvas (immersive-entry-chip, inside the reply's .markdown): the version the reply shows is an inline-preview
+      // (div.title, gem-button[aria-haspopup] > button[aria-label="Export"]: ".md" for a document, "Download code" for
+      // code; "Drive" / "Google Sites" are never pressed); older versions are gem-processing-card cards with
+      // [aria-label="Open <title> in Canvas"]. "Open" on a file expands the card in place (live 2026-11-23):
+      // generated-file > generated-file-senna-preview > div.senna-preview-container (.title-container .title = the name
+      // without extension, an Export button[aria-haspopup] labelled only by its text, Fullscreen, Close; page images).
+      // It renders only while the tab is visible, as does a card left expanded (an empty generated-file meanwhile);
+      // an expanded card is listed as an export entry. Chinese labels are guesses.
+      fileChip: ['generated-file button[aria-label]', 'immersive-entry-chip gem-processing-card button[aria-label]'],
+      fileChipLabel: [
+        [/^Download (.+)$/i, 'download'],
+        [/^Open (.+) in Canvas$/i, 'canvas'],
+        [/^Open (.+)$/i, 'preview'],
+        [/^下载\s*(.+)$/, 'download'],
+        [/^在\s*Canvas\s*中打开\s*(.+)$/i, 'canvas'],
+        [/^打开\s*(.+)$/, 'preview'],
+      ],
+      fileCard: 'generated-file, gem-processing-card',
+      fileCardType: '.file-type-lr',
+      previewDownload: [
+        '.senna-preview-container .title-container button[aria-haspopup]',
+        'button[aria-label="Export"]',
+        'button[aria-label="导出"]',
+        'button[aria-label="Download"]',
+        'button[aria-label="下载"]',
+      ],
+      previewPanel: ['.senna-preview-container', 'inline-preview', 'immersive-panel', '[class*="immersive-panel" i]', '[role="dialog"]', '[class*="side-panel" i]', 'aside'],
+      // A panel's title is compared exactly: several can be open at once, and "X（审阅修订版）" is not "X".
+      previewTitle: '.title-container .title',
+      // A generated-file without any button has not rendered yet (hidden tab): counted as files_pending.
+      filePending: 'generated-file',
+      previewClose: ['button[aria-label="Close"]', 'button[aria-label="关闭"]'],
       // Gemini's "Tools" (Deep Research, Canvas, …) are not wired up: select_model { tool } → NOT_SUPPORTED.
       toolsButton: [],
       toolPill: [],
@@ -207,8 +236,19 @@
       researchBusyText: null,
       researchProgress: [],
       researchDoneText: null,
-      exportControl: [],
-      exportLabel: null,
+      exportControl: [
+        'inline-preview button[aria-label="Export"]',
+        'inline-preview button[aria-label="导出"]',
+        'generated-file-senna-preview .title-container button[aria-haspopup]',
+      ],
+      exportLabel: /^(export|导出)$/i,
+      // An export control inside exportScope is named by its exportTitle (the Canvas or file title), and may sit in .markdown.
+      exportScope: 'inline-preview, generated-file-senna-preview',
+      // An expanded Canvas: a Canvas card whose title it shows exports through it (file_click).
+      canvasPanel: ['inline-preview'],
+      exportTitle: '.title-container .title',
+      // Menus Gemini renders as a gem-popover (the Export menu), besides the generic containers.
+      menuContainers: ['gem-popover'],
     },
   };
   const SELECTORS = SITE_SELECTORS[SITE];
@@ -642,7 +682,7 @@
   const byDocumentOrder = (a, b) => (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1);
 
   function menuItems(baseline) {
-    const containers = all(MENU_CONTAINERS).filter(visible);
+    const containers = all([...MENU_CONTAINERS, ...(SELECTORS.menuContainers || [])]).filter(visible);
     let items = containers.flatMap((c) => all(MENU_ITEMS, c));
     if (!items.length) items = containers.flatMap((c) => all(['button', '[role="button"]', 'a[href]'], c));
     const skip = SELECTORS.menuSkip.join(', ');
@@ -1326,16 +1366,29 @@
 
   const fileKey = (s) => String(s ?? '').normalize('NFC').replace(/\s+/g, ' ').trim();
 
-  // { kind, name, label } when the control's label names a file and its text shows that name (or the start of it).
+  // { kind, name, label, title?, type? } when the control's label names a file and its text — or the text of the card
+  // around it (fileCard: Gemini, whose buttons read "Open") — shows that name (or the start of it). A card that shows
+  // the type apart ("DOCX") gets it as the extension: name "<shown name>.docx", title the shown name.
   function chipFile(el) {
     const label = fileKey(el.getAttribute('aria-label'));
+    const card = SELECTORS.fileCard ? el.closest(SELECTORS.fileCard) : null;
     for (const [re, kind] of SELECTORS.fileChipLabel) {
       const name = label.match(re)?.[1]?.trim();
       if (!name) continue;
-      const text = fileKey(el.textContent).replace(/(…|\.\.\.)$/, '');
-      if (text && (text.includes(name) || (text.length >= 4 && name.startsWith(text)))) return { kind, name, label };
+      const text = fileKey((card || el).textContent).replace(/(…|\.\.\.)$/, '');
+      if (!text || !(text.includes(name) || (text.length >= 4 && name.startsWith(text)))) continue;
+      const type = card && SELECTORS.fileCardType ? fileKey(card.querySelector(SELECTORS.fileCardType)?.textContent) : '';
+      const ext = /^[a-z0-9]{1,6}$/i.test(type) && !name.toLowerCase().endsWith(`.${type.toLowerCase()}`) ? `.${type.toLowerCase()}` : '';
+      return { kind, name: name + ext, label, ...(card && { title: name }), ...(type && { type }) };
     }
     return null;
+  }
+
+  // Whether pressing the control opens a menu (aria-haspopup on it or on its wrapper, e.g. Gemini's gem-button).
+  function opensMenu(el) {
+    const holder = [el, el?.parentElement].find((n) => n?.hasAttribute?.('aria-haspopup'));
+    const popup = holder?.getAttribute('aria-haspopup');
+    return popup === 'menu' || popup === 'true' || (!!el && el.hasAttribute('aria-expanded'));
   }
 
   function fileChips(parts) {
@@ -1357,13 +1410,14 @@
     const scopes = [...parts, ...all('[role="dialog"]').filter((d) => visible(d) && d.querySelector(SELECTORS.markdown))];
     const found = new Set();
     for (const s of scopes) for (const el of all(SELECTORS.exportControl, s)) found.add(el);
-    const labelled = (el) => fileKey(el.getAttribute('aria-label') || el.textContent);
+    const labelled = (el) => fileKey(el.getAttribute('aria-label') || labelOf(el));
+    const scopeOf = (el) => (SELECTORS.exportScope ? el.closest(SELECTORS.exportScope) : null);
     const hits = [...found]
       .sort(byDocumentOrder)
-      .filter((el) => visible(el) && !el.closest(SELECTORS.markdown) && !chipFile(el) && SELECTORS.exportLabel.test(labelled(el)));
+      .filter((el) => visible(el) && (!el.closest(SELECTORS.markdown) || scopeOf(el)) && !chipFile(el) && SELECTORS.exportLabel.test(labelled(el)));
     return outermost(hits).map((el) => {
-      const popup = el.getAttribute('aria-haspopup');
-      return { el, kind: 'export', name: labelled(el), label: labelled(el), menu: popup === 'menu' || popup === 'true' || el.hasAttribute('aria-expanded') };
+      const title = fileKey(scopeOf(el)?.querySelector(SELECTORS.exportTitle)?.textContent);
+      return { el, kind: 'export', name: title || labelled(el), label: labelled(el), menu: opensMenu(el) };
     });
   }
 
@@ -1383,16 +1437,33 @@
       // false: the latest message is the user's, so this is the reply before it
       current: r.current,
       generating: generating(),
-      files: replyFiles(r.parts).map(({ kind, name, label, menu }, index) => ({ index, name, kind, label, ...(kind === 'export' && { menu }) })),
+      files: replyFiles(r.parts).map(({ kind, name, label, menu, type }, index) => ({ index, name, kind, label, ...(kind === 'export' && { menu }), ...(type && { type }) })),
+      // Gemini: file cards not rendered yet (its tab is hidden) — not in files.
+      ...(SELECTORS.filePending && { files_pending: r.parts.flatMap((part) => all([SELECTORS.filePending], part)).filter((el) => !el.querySelector('button')).length }),
     };
   }
 
   function fileClick({ message, index, name }) {
     const chip = replyFiles(replyAt(message).parts)[index];
     if (!chip || chip.name !== name) throw fail('FILE_CHANGED', `the reply no longer shows "${name}" as file ${index} — call list_files again; nothing was clicked`);
-    if (chip.kind === 'preview') {
-      // What is on the page before the click, so the panel is told apart by what appears.
-      state.preview = { name, chip: chip.el, controls: new Set(previewControls()), panels: new Set(all(SELECTORS.previewPanel)), control: null, panel: null };
+    if (chip.kind === 'canvas') {
+      // A Canvas card points at a Canvas the page may already show expanded (in another reply, with the same title — live
+      // 2026-11-23: every card of it carries the same time); that one is used as it is. Pressing "Open" there leaves its
+      // Export menu unopenable.
+      const key = fileKey(chip.title || name);
+      const shown = all(SELECTORS.canvasPanel || []).find((el) => visible(el) && fileKey(el.querySelector(SELECTORS.previewTitle)?.textContent) === key);
+      const control = shown && firstVisible(SELECTORS.previewDownload, shown);
+      if (control) {
+        state.preview = { name, title: key, chip: chip.el, controls: new Set(), panels: new Set(), dialogs: new Set(pageDialogs()), control, panel: shown, reused: true };
+        return { clicked: false, kind: chip.kind, name, reused: describe(shown) };
+      }
+    }
+    if (chip.kind === 'preview' || chip.kind === 'canvas') {
+      // What is on the page before the click, so the panel is told apart by what appears. title: the name the panel
+      // shows (Gemini: without the extension).
+      state.preview = {
+        name, title: chip.title || name, chip: chip.el, controls: new Set(previewControls()), panels: new Set(all(SELECTORS.previewPanel)), dialogs: new Set(pageDialogs()), control: null, panel: null,
+      };
     }
     // An export control may open a menu of formats: read afterwards with model_menu_read (new items only).
     if (chip.kind === 'export') state.menuBaseline = new Set(menuItems(null));
@@ -1400,17 +1471,30 @@
     return { clicked: true, kind: chip.kind, name };
   }
 
+  // Dialogs that ask something (Gemini asks to "Allow" before it opens some Canvas versions): reported, never answered.
+  const DIALOGS = ['[role="alertdialog"]', '[role="dialog"]', 'mat-dialog-container', '.mat-mdc-dialog-container'];
+  function pageDialogs() {
+    return outermost(all(DIALOGS).filter(visible));
+  }
+
   function previewControls() {
     const els = new Set(all(SELECTORS.previewDownload));
-    for (const b of all(['button', '[role="button"]'])) if (/^(download|下载)$/i.test(fileKey(b.textContent))) els.add(b);
+    for (const b of all(['button', '[role="button"]'])) if (/^(download|下载|export|导出)$/i.test(fileKey(labelOf(b)))) els.add(b);
     return [...els];
   }
 
   function previewState() {
     const p = state.preview;
     if (!p) throw fail('NO_PREVIEW', 'no preview was opened — file_click a preview chip first');
-    const key = fileKey(p.name);
-    const names = (el) => fileKey(el.textContent).includes(key) || fileKey(el.getAttribute('aria-label')).includes(key);
+    if (p.reused && p.panel?.isConnected && p.control?.isConnected) {
+      return { open: true, download: true, menu: opensMenu(p.control), panel: describe(p.panel), control: describe(p.control), reused: true };
+    }
+    const key = fileKey(p.title || p.name);
+    const names = (el) => {
+      const title = SELECTORS.previewTitle && (el.matches?.(SELECTORS.previewTitle) ? el : el.querySelector(SELECTORS.previewTitle));
+      if (title) return [p.title, p.name].some((n) => fileKey(title.textContent) === fileKey(n));
+      return fileKey(el.textContent).includes(key) || fileKey(el.getAttribute('aria-label')).includes(key);
+    };
     // Never the chip, the reply around it, or anything inside the chip.
     const apart = (el) => visible(el) && !el.contains(p.chip) && !p.chip.contains(el);
     // Download controls that came with the panel; a chip of another file is never one.
@@ -1431,11 +1515,19 @@
       // A panel that was already open (another file's preview) and now shows this file.
       panel = outermost(all(SELECTORS.previewPanel).filter((el) => apart(el) && names(el)))[0] || null;
     }
-    const control = controls.find((c) => panel?.contains(c)) || (controls.length === 1 ? controls[0] : null);
+    // A panel that was already open and now shows this file (a Canvas reopened in place) keeps its own control.
+    const control =
+      controls.find((c) => panel?.contains(c)) || (controls.length === 1 ? controls[0] : null) || (panel && previewControls().find((c) => panel.contains(c) && visible(c) && !p.chip.contains(c))) || null;
     p.panel = panel;
     p.control = control;
-    const out = { open: !!(panel || control), download: !!control, panel: panel ? describe(panel) : null, control: control ? describe(control) : null };
-    if (!out.open) out.outline = inspect({ selector: '[role="dialog"], aside, [class*="preview" i]', depth: 4, max_nodes: 80 }).tree;
+    // menu: the control opens a menu of formats (Gemini's "Export"), chosen by the server like a report export.
+    const out = { open: !!(panel || control), download: !!control, menu: !!control && opensMenu(control), panel: panel ? describe(panel) : null, control: control ? describe(control) : null };
+    // A dialog that came up with the press and asks something (buttons other than the panel's own).
+    const asking = pageDialogs().find((d) => !p.dialogs?.has(d) && !d.contains(p.chip) && all(['button', '[role="button"]'], d).some((b) => visible(b) && !/^(close|关闭|×)$/i.test(fileKey(labelOf(b)))));
+    if (asking && !(panel && (asking === panel || panel.contains(asking)) && control)) {
+      out.dialog = { text: clip(fileKey(asking.innerText || asking.textContent), 300), buttons: all(['button', '[role="button"]'], asking).filter(visible).map((b) => fileKey(labelOf(b))).filter(Boolean).slice(0, 8) };
+    }
+    if (!out.open) out.outline = inspect({ selector: [...new Set(['[role="dialog"]', 'aside', '[class*="preview" i]', ...SELECTORS.previewPanel])].join(', '), depth: 4, max_nodes: 80 }).tree;
     return out;
   }
 
@@ -1443,8 +1535,11 @@
     if (!state.preview?.control?.isConnected) previewState();
     const c = state.preview.control;
     if (!c) throw fail('PREVIEW_NO_DOWNLOAD', 'the preview shows no download button');
+    const menu = opensMenu(c);
+    // Its menu is read afterwards with model_menu_read (new items only).
+    if (menu) state.menuBaseline = new Set(menuItems(null));
     press(c);
-    return { clicked: describe(c) };
+    return { clicked: describe(c), menu };
   }
 
   const endLine = (s) => (s.endsWith('\n') ? s : `${s}\n`);
@@ -1470,6 +1565,7 @@
   function previewClose() {
     const p = state.preview;
     state.preview = null;
+    if (p?.reused) return { closed: null, reused: true }; // it was open before: left as it was
     const panel = p?.panel?.isConnected ? p.panel : null;
     if (!panel) return { closed: null };
     for (let scope = panel, i = 0; scope && scope !== document.body && i < 4; scope = scope.parentElement, i++) {

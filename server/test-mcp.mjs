@@ -253,8 +253,22 @@ const REPLY_FILES = [
   ['decision_summary.md', 'preview'],
 ].map(([name, kind], index) => ({ index, name, kind, label: `${kind === 'download' ? 'Download' : 'Open preview of'} ${name}` }));
 const PREVIEW_TEXT = '# Decision summary\n\n- take A and C\n';
+// Gemini (live 2026-11-23): generated-file cards — "Open" (DOCX: a viewer whose Export menu offers Download / Drive) or
+// "Download" (ZIP) —, the Canvas the reply shows (Export: ".md" / Drive) and an older Canvas version ("Open … in Canvas",
+// whose Export offers Google Sites / Download code). previewMenu: the Export menu a preview's panel opens.
+const GEMINI_FILES = [
+  { index: 0, name: '研发说明_代码架构.docx', kind: 'preview', label: 'Open 研发说明_代码架构', type: 'DOCX' },
+  { index: 1, name: '软著交付包（修订版）.zip', kind: 'download', label: 'Download 软著交付包（修订版）', type: 'ZIP' },
+  { index: 2, name: 'Research Idea Survey Prompt', kind: 'export', label: 'Export', menu: true },
+  { index: 3, name: 'Xiao Liang — 个人主页', kind: 'canvas', label: 'Open Xiao Liang — 个人主页 in Canvas' },
+];
+const GEMINI_MENUS = { 0: ['Download', 'Drive'], 2: ['.md', 'Drive'], 3: ['Google Sites', 'Download code'] };
+const GEMINI_EXPORTED = { Download: (name) => name, '.md': (name) => `${name}.md`, 'Download code': () => 'index.html' };
 function resetFiles() {
-  Object.assign(fake, { files: REPLY_FILES, filesLegacy: false, clickedFiles: [], previewClosed: 0, dl: { mode: 'ok', previewButton: true, requests: [], discarded: [], live: new Map(), ids: 0 } });
+  Object.assign(fake, {
+    files: REPLY_FILES, geminiFiles: GEMINI_FILES, geminiMenus: { ...GEMINI_MENUS }, previewMenu: null, previewDialog: null, geminiPending: 0, filesLegacy: false, clickedFiles: [], previewClosed: 0,
+    dl: { mode: 'ok', previewButton: true, requests: [], discarded: [], live: new Map(), ids: 0 },
+  });
 }
 resetFiles();
 
@@ -265,7 +279,11 @@ function fakeDownload(params) {
   if (fake.dl.mode === 'button_gone' && params.cmd === 'file_preview_download') throw { code: 'PREVIEW_NO_DOWNLOAD', message: 'the preview panel shows no download button' };
   if (params.cmd === 'file_click') fake.clickedFiles.push(params.args.name);
   // A report export: Chrome names the file (the format chosen in the export menu, or a direct download).
-  const exported = params.cmd === 'model_menu_choose' ? `deep-research-report.${/pdf/i.test(params.args.label) ? 'pdf' : 'md'}` : fake.files[params.args?.index]?.kind === 'export' ? 'deep-research-report.pdf' : null;
+  const gemini = params.site === 'gemini' && GEMINI_EXPORTED[params.args?.label];
+  const exported =
+    params.cmd === 'model_menu_choose'
+      ? gemini ? gemini(params.name) : `deep-research-report.${/pdf/i.test(params.args.label) ? 'pdf' : 'md'}`
+      : params.site !== 'gemini' && fake.files[params.args?.index]?.kind === 'export' ? 'deep-research-report.pdf' : null;
   if (params.cmd === 'model_menu_choose') fake.exportMenu = null;
   mkdirSync(FAKE_DOWNLOADS, { recursive: true });
   const file = path.join(FAKE_DOWNLOADS, exported ?? path.basename(params.name));
@@ -484,18 +502,34 @@ function fakeHandle(method, params) {
       return { pressed: 'button [aria-label="Remove"]', tool: null };
     case 'files_list':
       if (fake.filesLegacy) throw { code: 'UNKNOWN_COMMAND', message: 'unknown page command: files_list' };
-      if (params.site === 'gemini') return { supported: false, conversation_id: fake.newChat ? null : fake.conv, files: [] };
-      return { supported: true, conversation_id: fake.newChat ? null : fake.conv, message: args.message, replies: 1, current: true, generating: false, files: fake.files };
-    case 'file_click':
+      return {
+        supported: true, conversation_id: fake.newChat ? null : fake.conv, message: args.message, replies: 1, current: true, generating: false, files: params.site === 'gemini' ? fake.geminiFiles : fake.files,
+        ...(params.site === 'gemini' && { files_pending: fake.geminiPending }),
+      };
+    case 'file_click': {
       fake.clickedFiles.push(args.name);
-      if (fake.files[args.index]?.kind === 'export' && fake.files[args.index].menu) fake.exportMenu = ['Copy contents', 'Export to Markdown', 'Export to PDF'];
-      return { clicked: true, kind: fake.files[args.index]?.kind, name: args.name };
+      const f = (params.site === 'gemini' ? fake.geminiFiles : fake.files)[args.index];
+      if (params.site === 'gemini') {
+        if (f?.kind === 'export') fake.exportMenu = fake.geminiMenus[args.index];
+        else if (f?.kind === 'preview' || f?.kind === 'canvas') fake.previewMenu = fake.geminiMenus[args.index] ?? null;
+      } else if (f?.kind === 'export' && f.menu) fake.exportMenu = ['Copy contents', 'Export to Markdown', 'Export to PDF'];
+      return { clicked: true, kind: f?.kind, name: args.name };
+    }
     case 'file_preview_state':
-      return { open: true, download: fake.dl.previewButton, panel: 'aside [role="dialog"]', control: fake.dl.previewButton ? 'button [aria-label="Download"]' : null };
+      return {
+        open: true, download: fake.dl.previewButton, menu: fake.dl.previewButton && !!fake.previewMenu, panel: 'aside [role="dialog"]', control: fake.dl.previewButton ? 'button [aria-label="Download"]' : null,
+        ...(fake.previewDialog && { dialog: fake.previewDialog }),
+      };
+    case 'file_preview_download':
+      // A panel control that opens a menu (Gemini's Export) is pressed without a capture.
+      if (!fake.previewMenu) throw { code: 'INTERNAL', message: 'file_preview_download outside a capture without a menu' };
+      fake.exportMenu = fake.previewMenu;
+      return { clicked: 'button [aria-label="Export"]', menu: true };
     case 'file_preview_text':
       return { text: PREVIEW_TEXT, source: 'pre' };
     case 'file_preview_close':
       fake.previewClosed++;
+      fake.previewMenu = null;
       return { closed: 'button' };
     case 'inspect':
       return { url: 'https://chatgpt.com/c/conv-test', selector: args.selector, matched: 1, nodes: 2, truncated: false, tree: args.selector.includes('menu') ? 'div [role="menu"]\n  div [role="menuitemradio"] "Instant"' : 'main\n  div [data-testid="x"]' };
@@ -1558,11 +1592,20 @@ try {
     JSON.stringify(r.data),
   );
   r = await call('list_files', { site: 'chatgpt', message: 1 });
+  check('list_files on ChatGPT has no files_pending and no warning', !r.isError && !('files_pending' in r.data) && !r.data.warning, JSON.stringify(r.data));
   check('list_files passes "message" (replies back) to the page', !r.isError && r.data.message === 1, JSON.stringify(r.data));
   r = await call('list_files', { site: 'chatgpt', message: 'previous' });
   check('a malformed "message" → INVALID_ARGUMENT', r.isError && r.data.error.code === 'INVALID_ARGUMENT', JSON.stringify(r.data));
   r = await call('list_files', { site: 'gemini' });
-  check('list_files on Gemini → supported: false, no files', !r.isError && r.data.supported === false && r.data.files.length === 0, JSON.stringify(r.data));
+  check(
+    'list_files on Gemini lists file cards (with their type), the Canvas the reply shows and an older Canvas',
+    !r.isError && r.data.supported === true && r.data.files.map((f) => f.kind).join() === 'preview,download,export,canvas' && r.data.files[0].type === 'DOCX' && r.data.files[0].name.endsWith('.docx') && !r.data.warning,
+    JSON.stringify(r.data),
+  );
+  fake.geminiPending = 2;
+  r = await call('list_files', { site: 'gemini' });
+  check('…cards not rendered in a hidden Gemini tab → files_pending with a warning to show_tab', !r.isError && r.data.files_pending === 2 && /show_tab/.test(r.data.warning), JSON.stringify(r.data));
+  fake.geminiPending = 0;
 
   const bodyA = FILE_BODY('0593c80_A_gemma.patch');
   const savedA = path.join(DL, '0593c80_A_gemma.patch');
@@ -1654,7 +1697,7 @@ try {
   check(
     'a preview chip: opens the panel, downloads through its download button, closes the panel',
     !r.isError && r.data.via === 'preview-download' && r.data.kind === 'preview' && dlReq.cmd === 'file_preview_download' && fake.clickedFiles.at(-1) === '0593c80_three_patches.md' &&
-      fake.previewClosed === 1 && readFileSync(r.data.path, 'utf8') === FILE_BODY('0593c80_three_patches.md') && fake.received.slice(mark).join() === 'page:files_list,page:file_click,page:file_preview_state,download,download_discard,page:file_preview_close',
+      fake.previewClosed === 1 && readFileSync(r.data.path, 'utf8') === FILE_BODY('0593c80_three_patches.md') && /^page:files_list,page:file_click,(page:file_preview_state,)+download,download_discard,page:file_preview_close$/.test(fake.received.slice(mark).join()),
     JSON.stringify({ data: r.data, received: fake.received.slice(mark) }),
   );
   fake.dl.previewButton = false;
@@ -1681,8 +1724,62 @@ try {
     JSON.stringify(r.data),
   );
   fake.dl.mode = 'ok';
-  r = await call('download_file', { site: 'gemini', name: 'notes.md', save_to: DL });
-  check('download_file on Gemini → NOT_SUPPORTED', r.isError && r.data.error.code === 'NOT_SUPPORTED', JSON.stringify(r.data));
+  // Gemini: a ZIP card downloads at once; "Open" on a DOCX shows a viewer whose Export menu offers Download / Drive; a
+  // Canvas exports through its menu (".md", "Download code"); Drive / Google Sites are never pressed.
+  const GDL = path.join(TMP, 'gemini-out');
+  r = await call('download_file', { site: 'gemini', index: 1, save_to: `${GDL}/` });
+  check(
+    'Gemini: a ZIP card\'s download button is caught like a chip (saved under the card\'s name + type)',
+    !r.isError && r.data.via === 'download' && r.data.path === path.join(GDL, '软著交付包（修订版）.zip') && existsSync(r.data.path) && fake.dl.requests.at(-1).cmd === 'file_click',
+    JSON.stringify(r.data),
+  );
+  mark = fake.received.length;
+  fake.hidden = true; // Gemini opens a file's preview only in a visible tab: download_file brings it forward first
+  r = await call('download_file', { site: 'gemini', name: '研发说明_代码架构.docx', save_to: `${GDL}/` });
+  check(
+    'Gemini: the hidden tab is brought forward, then "Open" on a DOCX → its Export menu → "Download" (never Drive), saved as the .docx, preview closed',
+    !r.isError && r.data.via === 'preview-export' && r.data.format === 'Download' && r.data.path === path.join(GDL, '研发说明_代码架构.docx') && r.data.tab_shown === true && fake.hidden === false &&
+      fake.dl.requests.at(-1).cmd === 'model_menu_choose' && fake.dl.requests.at(-1).args.label === 'Download' && fake.previewMenu === null &&
+      /show_tab,.*page:file_click,.*page:file_preview_download/.test(since(mark).join()),
+    JSON.stringify(r.data),
+  );
+  r = await call('download_file', { site: 'gemini', index: 2, save_to: `${GDL}/` });
+  check(
+    'Gemini: the Canvas the reply shows → Export → ".md", saved under the downloaded name',
+    !r.isError && r.data.kind === 'export' && r.data.format === '.md' && r.data.path === path.join(GDL, 'Research Idea Survey Prompt.md') && existsSync(r.data.path),
+    JSON.stringify(r.data),
+  );
+  r = await call('download_file', { site: 'gemini', index: 3, save_to: `${GDL}/` });
+  check(
+    'Gemini: an older Canvas is opened, then Export → "Download code" (Google Sites skipped), saved under the downloaded name',
+    !r.isError && r.data.kind === 'canvas' && r.data.via === 'preview-export' && r.data.format === 'Download code' && r.data.path === path.join(GDL, 'index.html'),
+    JSON.stringify(r.data),
+  );
+  fake.geminiMenus[2] = ['Drive'];
+  let reqs = fake.dl.requests.length;
+  r = await call('download_file', { site: 'gemini', index: 2, save_to: `${GDL}/` });
+  check('Gemini: an Export menu that only sends to Drive → FORMAT_NOT_FOUND, nothing downloaded', r.isError && r.data.error.code === 'FORMAT_NOT_FOUND' && fake.dl.requests.length === reqs && fake.exportMenu === null, JSON.stringify(r.data));
+  fake.geminiMenus[2] = GEMINI_MENUS[2];
+  // Opening an older Canvas may make Gemini ask first ("Allow"): reported, never answered, nothing downloaded.
+  fake.previewDialog = { text: 'Open this version? Allow', buttons: ['Cancel', 'Allow'] };
+  reqs = fake.dl.requests.length;
+  mark = fake.received.length;
+  r = await call('download_file', { site: 'gemini', index: 3, save_to: `${GDL}/` });
+  check(
+    'Gemini: a dialog the page puts up after "Open" → PAGE_DIALOG with its text and buttons; nothing pressed in it, nothing downloaded',
+    r.isError && r.data.error.code === 'PAGE_DIALOG' && r.data.error.dialog.buttons.includes('Allow') && fake.dl.requests.length === reqs && !since(mark).includes('page:file_preview_download'),
+    JSON.stringify(r.data),
+  );
+  fake.previewDialog = null;
+  fake.dl.previewButton = false;
+  mark = fake.received.length;
+  r = await call('download_file', { site: 'gemini', index: 0, save_to: `${GDL}/again.docx` });
+  check(
+    'Gemini: a DOCX viewer without an export control → PREVIEW_NO_DOWNLOAD, its text is never saved as the .docx',
+    r.isError && r.data.error.code === 'PREVIEW_NO_DOWNLOAD' && !existsSync(path.join(GDL, 'again.docx')) && !since(mark).includes('page:file_preview_text') && since(mark).includes('page:file_preview_close'),
+    JSON.stringify(r.data),
+  );
+  fake.dl.previewButton = true;
   r = await call('download_file', { site: 'chatgpt', name: '0593c80_A_gemma.patch', save_to: 'relative/dir' });
   check('a relative save_to → INVALID_ARGUMENT', r.isError && r.data.error.code === 'INVALID_ARGUMENT', JSON.stringify(r.data));
   fake.filesLegacy = true;
