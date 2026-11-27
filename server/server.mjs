@@ -148,7 +148,8 @@ function notConnectedError() {
   } else {
     hint = 'make sure Chrome is running with the "ChatGPT MCP Bridge (local)" extension enabled; it reconnects within ~30 s';
   }
-  return new ToolError('EXTENSION_NOT_CONNECTED', `Chrome extension is not connected: ${hint}`);
+  return new ToolError('EXTENSION_NOT_CONNECTED', `Chrome extension is not connected: ${hint}`,
+    bridge.listenError?.code ? { listen_code: bridge.listenError.code } : null);
 }
 
 function ensureConnected() {
@@ -1844,6 +1845,7 @@ const TOOLS = [
       type: 'object',
       properties: {
         text: { type: 'string', description: 'message to send, verbatim' },
+        expect_model: { type: 'string', description: 'Exact visible model name required before filling the composer, e.g. Pro (case-insensitive).' },
         expect_conversation_id: {
           type: 'string',
           description: 'conversation id or URL the tab must currently show; "new" or the site\'s new-chat URL (https://chatgpt.com/, https://gemini.google.com/app) = the tab must be on an empty new chat (no conversation id, no messages)',
@@ -2097,6 +2099,14 @@ const handlers = {
     const shown = await ensureVisible(site, onHidden, s, 'typed');
     // A new chat goes out in the default mode (Gemini: Task) — switched after the tab is shown, before typing.
     const mode = await ensureDefaultMode(site, s, { strict: true, done: 'typed' });
+
+    if (args.expect_model != null) {
+      const required = requireString(args, 'expect_model').trim();
+      const current = (await page(site, 'model_state')).model?.trim();
+      if (!current || current.toLowerCase() !== required.toLowerCase()) {
+        throw new ToolError('MODEL_MISMATCH', `expected "${required}", model picker shows "${current || 'unknown'}"; nothing typed`);
+      }
+    }
 
     const filled = await page(site, 'fill_composer', { text, expect_conversation_id: expected }, 30_000);
     // Wait for the send button to enable. click_send clicks at most once per fill, and any error

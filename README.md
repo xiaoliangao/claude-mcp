@@ -39,6 +39,17 @@ node server/test-mcp.mjs             # 验收测试（端口 17373 被占用时�
 claude mcp add --scope user chatgpt-web -- "$(which node)" "$PWD/server/server.mjs"
 ```
 
+## 从终端或 Codex 送审
+
+在仓库根目录运行以下命令。送审入口用 MCP 打开新的 ChatGPT 对话，确认 Pro、上传附件、发送一次，并在回复完成后输出实际保存路径和 SHA-256。
+
+```bash
+node server/review.mjs --out review.md --prompt '请审查附件中的实验设计' proposal.md
+node server/review.mjs --out review.md --resume 'https://chatgpt.com/c/对话ID'
+```
+
+中途退出后，可以用第二条命令取回该对话最新的回复。已有文件会采用编号副本。扩展端口已被其他客户端占用时，命令会报出占用原因并退出；可在原客户端继续，或在其释放端口后恢复。
+
 ## 工具一览
 
 所有工具都接受可选参数 `site: "chatgpt" | "gemini"`，省略时沿用最近一次 `open_conversation` 打开的站点（初始为 `chatgpt`）；`open_conversation` 根据 URL 自动判断站点。
