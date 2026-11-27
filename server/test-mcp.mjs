@@ -1132,6 +1132,12 @@ try {
   picker.pressed = [];
   r = await call('select_model', { model: 'GPT' });
   check('ambiguous model → AMBIGUOUS_OPTION, nothing chosen, menu closed', r.isError && r.data.error.code === 'AMBIGUOUS_OPTION' && picker.model === 'GPT-4o' && !picker.open, JSON.stringify(r.data));
+  const beforeWrongModel = fake.received.length;
+  r = await call('send_message', { site: 'chatgpt', text: 'review', expect_model: 'Pro' });
+  check('a changed model rejects a review before typing or clicking send',
+    r.isError && r.data.error.code === 'MODEL_MISMATCH' &&
+    !fake.received.slice(beforeWrongModel).includes('page:fill_composer') &&
+    !fake.received.slice(beforeWrongModel).includes('page:click_send'), JSON.stringify(r.data));
   r = await call('select_model', { model: 'heavy' });
   check('a slider level is reached with arrow keys, stopping at the exact name', !r.isError && picker.level === 4 && picker.keys === 2 && r.data.models[0].value === 'Heavy' && picker.model === 'GPT-4o', JSON.stringify(r.data));
   r = await call('select_model', { model: 'ext' });
